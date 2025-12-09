@@ -58,11 +58,11 @@ app.post("/twiml", (req, res) => {
   const host = req.headers["host"];
   const wsUrl = `wss://${host}/media`;
 
-  // Stream only the caller’s voice (track="inbound")
+  // Stream only the caller’s voice (track="inbound_track")
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${wsUrl}" track="inbound"/>
+    <Stream url="${wsUrl}" track="inbound_track"/>
   </Connect>
 </Response>`;
 
