@@ -3,10 +3,9 @@ import bodyParser from "body-parser";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
-// Helper to generate a time‑based greeting (Europe/Madrid timezone)
+// Helper function for time-based greeting (Europe/Madrid timezone)
 function getTimeBasedGreeting() {
   const now = new Date();
-  // Convert to Europe/Madrid timezone
   const madridTime = new Date(
     now.toLocaleString("en-US", { timeZone: "Europe/Madrid" })
   );
@@ -24,48 +23,46 @@ if (!OPENAI_API_KEY) {
 const OPENAI_REALTIME_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-// Roy's personality / behavior
+// Roy's personality and call flow instructions
 const ROY_INSTRUCTIONS = `
-You are Roy, a human-sounding receptionist for 24/7 AI Assistant. Never say you are an AI.
+You are Roy, a human-sounding phone receptionist for 24/7 AI Assistant. Never say you are an AI.
 
 — Service summary:
-24/7 AI Assistant builds virtual receptionists that answer phone calls, chats, and emails 24/7 for hotels, rentals, clinics, salons, small businesses, and professional services. It helps with reservations, bookings, questions, and captures leads (name, email, phone, business type).
+24/7 AI Assistant builds virtual receptionists that answer phone calls, chats, and emails 24/7 for hotels, rentals, clinics, salons, small businesses, and professional services. It helps with bookings, questions, and lead capture (name, phone, email, business type).
 
 — Greeting:
 Use the helper function to say "Good morning/afternoon/evening, this is Roy from 24/7 AI Assistant. How can I help you today?" at the start of each call.
 
 — Speaking style:
-• Speak quickly and naturally with short sentences (1–2 sentences). Use contractions ("I’m", "we’re").
-• Listen while you speak. Continue if the caller only says filler words (“yes”, “yeah”, “uh-huh”) or background noise. Ignore those.
-• If the caller starts a new sentence or question, stop immediately, acknowledge, answer briefly, then continue the flow.
+• Speak quickly and naturally with short sentences (1–2 sentences). Use contractions ("I'm", "we're").
+• Listen while you speak. Continue if the caller says filler words ("yes", "yeah", "uh-huh") or there is background noise.
+• If the caller starts a new sentence or question, stop immediately, acknowledge, answer briefly, then return to your flow.
 • If the caller sounds Spanish, you may answer in Spanish; otherwise use English.
 • Be friendly and confident.
 
 — Call flow:
-1. Greet with the time-based greeting.
+1. Greet using the time-based greeting.
 2. Ask what type of business they run.
 3. Explain how 24/7 AI Assistant helps that type of business.
 4. Offer to record their name, email, phone number, or schedule a demo.
-5. Confirm contact details before ending.
+5. Confirm the contact details before ending.
 `;
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Twilio will POST here when a call comes in
+// Twilio webhook for incoming calls
 app.post("/twiml", (req, res) => {
   const host = req.headers["host"];
   const wsUrl = `wss://${host}/media`;
-
-  // Stream only the caller’s voice (track="inbound_track")
+  // Stream only the caller's voice to avoid echo
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${wsUrl}" track="inbound_track"/>
   </Connect>
 </Response>`;
-
   res.type("text/xml").send(twiml);
 });
 
@@ -86,53 +83,53 @@ wss.on("connection", (twilioSocket) => {
   let openaiReady = false;
   const pendingAudio = [];
 
-  // Connect to OpenAI Realtime
+  // Connect to OpenAI Realtime API
   openaiSocket = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
+      "OpenAI-Beta": "realtime=v1",
+    },
   });
 
   openaiSocket.on("open", () => {
     console.log("🧠 OpenAI Realtime connected");
     openaiReady = true;
 
-    // Configure session
+    // Configure session with proper audio formats and voice
     const sessionUpdate = {
       type: "session.update",
       session: {
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        // Use OpenAI's "onyx" voice; no ElevenLabs here
         voice: "onyx",
         instructions: ROY_INSTRUCTIONS,
         modalities: ["audio", "text"],
         temperature: 0.7,
         turn_detection: { type: "server_vad" },
-        input_audio_transcription: { model: "whisper-1" }
-      }
+        input_audio_transcription: { model: "whisper-1" },
+      },
     };
     openaiSocket.send(JSON.stringify(sessionUpdate));
 
-    // Initial greeting using the time-based helper
+    // Initial greeting based on Madrid time
+    const greeting = `${getTimeBasedGreeting()}, this is Roy from 24/7 AI Assistant. How can I help you today?`;
     const initialResponse = {
       type: "response.create",
       response: {
-        instructions: `${getTimeBasedGreeting()}, this is Roy from 24/7 AI Assistant. How can I help you today?`,
-        modalities: ["audio", "text"]
-      }
+        instructions: greeting,
+        modalities: ["audio", "text"],
+      },
     };
     openaiSocket.send(JSON.stringify(initialResponse));
 
-    // Flush buffered audio if any
+    // Flush any buffered audio once OpenAI is ready
     for (const msg of pendingAudio) {
       openaiSocket.send(JSON.stringify(msg));
     }
     pendingAudio.length = 0;
   });
 
-  // Forward audio from OpenAI to Twilio
+  // Forward OpenAI's audio output back to Twilio
   openaiSocket.on("message", (event) => {
     try {
       const data =
@@ -145,8 +142,8 @@ wss.on("connection", (twilioSocket) => {
           event: "media",
           streamSid,
           media: {
-            payload: data.delta // base64 g711_ulaw
-          }
+            payload: data.delta, // base64 g711_ulaw audio
+          },
         };
         if (twilioSocket.readyState === WebSocket.OPEN) {
           twilioSocket.send(JSON.stringify(twilioMsg));
@@ -168,14 +165,13 @@ wss.on("connection", (twilioSocket) => {
     console.error("❌ OpenAI WS error:", err);
   });
 
-  // Handle messages from Twilio
+  // Handle messages from Twilio (streamed audio)
   twilioSocket.on("message", (msg) => {
     try {
       const data =
         typeof msg === "string" ? JSON.parse(msg) : JSON.parse(msg.toString());
 
       const eventType = data.event;
-
       if (eventType === "start") {
         streamSid = data.start?.streamSid || null;
         console.log("▶️ Stream started:", streamSid);
@@ -187,7 +183,7 @@ wss.on("connection", (twilioSocket) => {
 
         const openaiMsg = {
           type: "input_audio_buffer.append",
-          audio: payload // base64 g711_ulaw from Twilio
+          audio: payload, // base64 g711_ulaw from Twilio
         };
 
         if (openaiReady && openaiSocket.readyState === WebSocket.OPEN) {
