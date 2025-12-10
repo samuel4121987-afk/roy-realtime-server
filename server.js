@@ -3,7 +3,7 @@ import bodyParser from "body-parser";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
-// Helper to generate a time-appropriate greeting in Madrid timezone
+// Helper to generate a time‑appropriate greeting in Madrid timezone
 function getTimeBasedGreeting() {
   const now = new Date();
   const madridTime = new Date(
@@ -25,8 +25,7 @@ const OPENAI_REALTIME_URL =
 
 // Roy’s personality / behaviour
 const ROY_INSTRUCTIONS = `
-You are Roy, a fast, natural, human-sounding phone receptionist for the service "24/7 AI Assistant".
-Never say you are an AI or a language model.
+You are Roy, a fast, natural, human-sounding phone receptionist for the service "24/7 AI Assistant". Never say you are an AI or a language model.
 
 WHAT 24/7 AI ASSISTANT DOES:
 - Builds AI receptionists that answer phone calls, chats, and emails 24/7.
@@ -34,18 +33,17 @@ WHAT 24/7 AI ASSISTANT DOES:
 - Handles bookings, reservations, questions, and lead capture (name, phone, email, business type).
 - Main value: "Never miss a customer again" and reduce staffing costs.
 
-STYLE:
-- Speak like a real human on the phone.
-- Short replies: 1–2 sentences at a time.
-- Use contractions: I'm, you're, we'll, don't, that's, it's.
-- Be friendly and confident, not robotic or overly formal.
-- If the caller sounds Spanish, you can answer in Spanish; otherwise use English.
-- If you don't catch a name, politely ask them to repeat or spell it.
+STYLE AND FLOW:
+- Always greet using a time‑based phrase (Good morning/afternoon/evening) followed by “this is Roy from 24/7 AI Assistant”. For example: “24/7 AI, good evening. This is Roy. How can I help you?”
+- Speak like a real person on the phone. Keep replies short (1–2 sentences) and use contractions (I'm, we'll, can't). Be warm and friendly, not robotic.
+- Listen while you speak. If the caller says more than just a quick acknowledgement (e.g. more than “yes” or “uh-huh”), pause what you were saying and respond to them. Afterwards, resume the prior topic.
+- Use English unless the caller clearly speaks Spanish; in that case, switch to Spanish.
+- If you don’t catch a name, politely ask them to repeat or spell it.
 
 CALL FLOW:
-1. Greet: "Hi, this is Roy from 24/7 AI Assistant. How can I help you today?"
+1. Greet with the time‑based phrase and identify yourself: “24/7 AI, [Good morning/afternoon/evening]. This is Roy from 24/7 AI Assistant. How can I help you?”
 2. Ask what kind of business they have (hotel, clinic, salon, rentals, small business, etc.).
-3. Briefly explain how 24/7 AI can help their specific business.
+3. Briefly explain how 24/7 AI can help their specific business.
 4. Offer to take their name, email, and phone number, or schedule a demo.
 5. Before ending, repeat their contact details back to confirm.
 6. End politely and professionally.
@@ -92,15 +90,15 @@ wss.on("connection", (twilioSocket) => {
   openaiSocket = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
+      "OpenAI-Beta": "realtime=v1",
+    },
   });
 
   openaiSocket.on("open", () => {
     console.log("🧠 OpenAI Realtime connected");
     openaiReady = true;
 
-    // Configure the session: audio codec and instructions
+    // Configure the session: audio codec, voice, and instructions
     const sessionUpdate = {
       type: "session.update",
       session: {
@@ -109,21 +107,21 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         instructions: ROY_INSTRUCTIONS,
         modalities: ["audio", "text"],
-        temperature: 0.7,
+        temperature: 0.6,
         turn_detection: { type: "server_vad" },
-        input_audio_transcription: { model: "whisper-1" }
-      }
+        input_audio_transcription: { model: "whisper-1" },
+      },
     };
     openaiSocket.send(JSON.stringify(sessionUpdate));
 
-    // Send the initial greeting
+    // Send the dynamic initial greeting based on current Madrid time
+    const greeting = getTimeBasedGreeting();
     const initialResponse = {
       type: "response.create",
       response: {
-        instructions:
-          "Greet the caller as Roy from 24/7 AI Assistant and ask how you can help.",
-        modalities: ["audio", "text"]
-      }
+        text: `24/7 AI, ${greeting}. This is Roy from 24/7 AI Assistant. How can I help you?`,
+        modalities: ["audio", "text"],
+      },
     };
     openaiSocket.send(JSON.stringify(initialResponse));
 
@@ -141,14 +139,14 @@ wss.on("connection", (twilioSocket) => {
           ? JSON.parse(event)
           : JSON.parse(event.toString());
 
-      // Only forward audio deltas back to Twilio
+      // Forward only audio deltas back to Twilio
       if (data.type === "response.audio.delta" && data.delta && streamSid) {
         const twilioMsg = {
           event: "media",
           streamSid,
           media: {
-            payload: data.delta // base64 g711_ulaw from OpenAI
-          }
+            payload: data.delta, // base64 g711_ulaw from OpenAI
+          },
         };
         if (twilioSocket.readyState === WebSocket.OPEN) {
           twilioSocket.send(JSON.stringify(twilioMsg));
@@ -189,7 +187,7 @@ wss.on("connection", (twilioSocket) => {
 
         const openaiMsg = {
           type: "input_audio_buffer.append",
-          audio: payload // base64 g711_ulaw from Twilio
+          audio: payload, // base64 g711_ulaw from Twilio
         };
 
         if (openaiReady && openaiSocket.readyState === WebSocket.OPEN) {
