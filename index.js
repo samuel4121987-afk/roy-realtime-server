@@ -200,6 +200,7 @@ wss.on("connection", (twilioSocket) => {
           modalities: ["audio", "text"],
           temperature: 0,
           instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+                    commit: true,
         },
       });
       return;
