@@ -23,7 +23,7 @@ app.set("trust proxy", 1);
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-/* ===== TWIML (GET + POST) ===== */
+/* ===== TWIML ===== */
 app.all("/twiml", (req, res) => {
   const proto = (req.headers["x-forwarded-proto"] || "https").toString();
   const host = (req.headers["x-forwarded-host"] || req.headers.host).toString();
@@ -52,7 +52,7 @@ wss.on("connection", (twilioSocket) => {
   let openaiReady = false;
   let greeted = false;
 
-  // Buffer audio from OpenAI until streamSid exists
+  // Buffer OpenAI audio until streamSid exists
   const pendingToTwilio = [];
 
   const openaiSocket = new WebSocket(OPENAI_REALTIME_URL, {
@@ -62,7 +62,6 @@ wss.on("connection", (twilioSocket) => {
     },
   });
 
-  /* ===== HELPERS ===== */
   function sendToTwilio(base64) {
     if (!streamSid) {
       pendingToTwilio.push(base64);
@@ -81,15 +80,18 @@ wss.on("connection", (twilioSocket) => {
     while (pendingToTwilio.length) sendToTwilio(pendingToTwilio.shift());
   }
 
-  function greet() {
+  function forceGreeting() {
     if (!openaiReady || !streamSid || greeted) return;
     greeted = true;
-    console.log("Greeting");
+
+    console.log("Greeting (forced exact)");
     openaiSocket.send(JSON.stringify({
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
-        instructions: "24 7 this is Roy how can I help you?",
+        temperature: 0,
+        instructions:
+          "Say EXACTLY this sentence and nothing else: 24 7 this is Roy how can I help you?",
       },
     }));
   }
@@ -99,26 +101,30 @@ wss.on("connection", (twilioSocket) => {
     openaiReady = true;
     console.log("OpenAI WS connected");
 
+    // Hard constraints to stop role-slip and “fake caller” lines
     const STYLE =
-      "You are Roy, a human phone receptionist. Sound natural, not robotic. " +
-      "Short 1–2 sentence replies. If the caller speaks Spanish, reply in Spanish. " +
+      "You are Roy, the receptionist. You ONLY speak as Roy. " +
+      "NEVER speak as the caller. NEVER say things like 'Hi Roy' or describe issues as if you are the caller. " +
+      "Do NOT narrate. Do NOT add filler acknowledgements like 'Understood' repeatedly. " +
+      "Short, natural 1–2 sentence replies. Sound human. " +
+      "If caller speaks Spanish, reply in Spanish; otherwise English. " +
       "Never say you are an AI.";
 
     openaiSocket.send(JSON.stringify({
       type: "session.update",
       session: {
-        modalities: ["audio", "text"],          // REQUIRED
-        input_audio_format: "g711_ulaw",         // Twilio μ-law
+        modalities: ["audio", "text"],      // REQUIRED by your error log
+        input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        voice: "alloy",                          // stable; change later if desired
-        temperature: 0.6,
+        voice: "alloy",
+        temperature: 0.5,
         turn_detection: { type: "server_vad" },
         instructions: STYLE,
       },
     }));
 
-    // greet once we have streamSid
-    setTimeout(greet, 250);
+    // Don’t wait on session.updated; just greet once streamSid exists
+    setTimeout(forceGreeting, 250);
   });
 
   openaiSocket.on("message", (raw) => {
@@ -132,12 +138,13 @@ wss.on("connection", (twilioSocket) => {
 
     if (evt.type === "session.updated" || evt.type === "session.created") {
       flushToTwilio();
-      greet();
+      forceGreeting();
       return;
     }
 
     if (evt.type === "response.audio.delta" && evt.delta) {
       sendToTwilio(evt.delta);
+      return;
     }
   });
 
@@ -157,12 +164,12 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start?.streamSid || null;
       console.log("Twilio start", streamSid);
       flushToTwilio();
-      greet();
+      forceGreeting();
       return;
     }
 
     if (data.event === "media") {
-      // ***** CRITICAL FIX: ONLY INBOUND AUDIO GOES TO OPENAI *****
+      // Critical: only inbound audio goes to OpenAI (prevents feedback loop)
       if (data.media?.track !== "inbound") return;
 
       if (openaiSocket.readyState === WebSocket.OPEN) {
