@@ -1,14 +1,13 @@
 {
-  "name": "roy-realtime-server",
+  "name": "roy-twilio-openai-realtime",
   "version": "1.0.0",
-  "main": "server.js",
-  "type": "module",
+  "private": true,
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.16.0",
     "express": "^4.19.2",
-    "body-parser": "^1.20.2"
+    "ws": "^8.18.0"
   }
 }
