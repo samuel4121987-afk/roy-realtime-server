@@ -44,8 +44,8 @@ wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
+
   let openaiReady = false;
-  let sessionReady = false;
   let greeted = false;
 
   const pendingAudioToTwilio = [];
@@ -78,16 +78,16 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function maybeGreet() {
-    if (!openaiReady || !sessionReady || !streamSid || greeted) return;
+  function greetNow() {
+    if (!openaiReady || !streamSid || greeted) return;
     greeted = true;
 
-    console.log("🔊 Greeting...");
+    console.log("🔊 Greeting…");
     openaiSocket.send(JSON.stringify({
       type: "response.create",
       response: {
-        // IMPORTANT: must be ['audio','text'] or OpenAI rejects
         modalities: ["audio", "text"],
+        // You wanted the exact line simple and human
         instructions: "24 7 this is Roy how can I help you?",
       },
     }));
@@ -97,20 +97,34 @@ wss.on("connection", (twilioSocket) => {
     openaiReady = true;
     console.log("✅ OpenAI WS connected");
 
-    // ✅ FIX: modalities must be ['text'] or ['audio','text']
+    // Short style guidance only (not a huge prompt)
+    const STYLE = [
+      "You are Roy, a human phone receptionist.",
+      "Sound natural, not robotic.",
+      "Short 1–2 sentence replies.",
+      "If caller speaks Spanish, reply in Spanish; otherwise English.",
+      "Do not say you are an AI."
+    ].join(" ");
+
     openaiSocket.send(JSON.stringify({
       type: "session.update",
       session: {
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        voice: "alloy",
+
+        // If 'verse' errors in logs, change to 'alloy'
+        voice: "verse",
+
         temperature: 0.6,
         turn_detection: { type: "server_vad" },
-        // keep prompt empty if you don't want it in code
-        instructions: "",
+        instructions: STYLE,
       },
     }));
+
+    // Do NOT wait for session.updated. It can lag or not appear in time.
+    // We’ll greet as soon as Twilio streamSid exists.
+    setTimeout(greetNow, 250);
   });
 
   openaiSocket.on("message", (raw) => {
@@ -126,11 +140,11 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    if (evt.type === "session.updated") {
-      sessionReady = true;
-      console.log("✅ OpenAI session.updated");
-      flushToTwilio();
-      maybeGreet();
+    // optional: see session lifecycle
+    if (evt.type === "session.updated" || evt.type === "session.created") {
+      console.log("✅ OpenAI", evt.type);
+      // if Twilio already started and we haven’t greeted, greet now
+      greetNow();
       return;
     }
 
@@ -161,7 +175,8 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start?.streamSid || null;
       console.log("✅ Twilio stream started:", streamSid);
       flushToTwilio();
-      maybeGreet();
+      // Greeting is keyed off having streamSid + OpenAI ready
+      greetNow();
       return;
     }
 
