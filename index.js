@@ -129,13 +129,23 @@ wss.on("connection", (twilioSocket) => {
 
     // If Twilio start already arrived, greet immediately.
     if (streamSid) {
+      // First, add a user message to the conversation
       sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-        },
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "Please greet the caller now."
+            }
+          ]
+        }
+      });
+      // Then trigger a response
+      sendToOpenAI({
+        type: "response.create"
       });
     }
   });
