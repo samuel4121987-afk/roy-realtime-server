@@ -3,51 +3,36 @@ import bodyParser from "body-parser";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
-/* ===== ENV ===== */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY");
-  process.exit(1);
-}
+if (!OPENAI_API_KEY) process.exit(1);
 
 const OPENAI_REALTIME_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-/* ===== APP ===== */
 const app = express();
 app.set("trust proxy", 1);
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-/* ===== TWIML ===== */
 app.post("/twiml", (req, res) => {
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host  = req.headers["x-forwarded-host"] || req.headers.host;
-  const wsScheme = proto === "http" ? "ws" : "wss";
-  const wsUrl = `${wsScheme}://${host}/media`;
+  const wsUrl = `${proto === "http" ? "ws" : "wss"}://${host}/media`;
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${wsUrl}" track="inbound_track" />
+    <Stream url="${wsUrl}" track="inbound_track"/>
   </Connect>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
+</Response>`);
 });
 
-app.get("/", (_req, res) => {
-  res.send("Roy server running.");
-});
-
-/* ===== SERVER ===== */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
 wss.on("connection", (twilioSocket) => {
-  let streamSid = null;
+  let streamSid;
   let openaiReady = false;
-  const pendingAudio = [];
 
   const openaiSocket = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
@@ -56,11 +41,9 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  /* ===== OPENAI READY ===== */
   openaiSocket.on("open", () => {
     openaiReady = true;
 
-    // Minimal session config — THIS IS THE SAFE WORKING SET
     openaiSocket.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -71,7 +54,7 @@ wss.on("connection", (twilioSocket) => {
       }
     }));
 
-    // Immediate greeting — no VAD, no delay
+    // 🔊 IMMEDIATE GREETING (WORKS)
     openaiSocket.send(JSON.stringify({
       type: "response.create",
       response: {
@@ -79,17 +62,11 @@ wss.on("connection", (twilioSocket) => {
         modalities: ["audio"]
       }
     }));
-
-    // Flush buffered audio
-    for (const msg of pendingAudio) {
-      openaiSocket.send(JSON.stringify(msg));
-    }
-    pendingAudio.length = 0;
   });
 
-  /* ===== OPENAI → TWILIO ===== */
   openaiSocket.on("message", (event) => {
     const data = JSON.parse(event);
+
     if (data.type === "response.audio.delta" && streamSid) {
       twilioSocket.send(JSON.stringify({
         event: "media",
@@ -99,17 +76,6 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  openaiSocket.on("close", () => {
-    if (twilioSocket.readyState === WebSocket.OPEN) {
-      twilioSocket.close();
-    }
-  });
-
-  openaiSocket.on("error", (err) => {
-    console.error("OpenAI WS error:", err);
-  });
-
-  /* ===== TWILIO → OPENAI ===== */
   twilioSocket.on("message", (msg) => {
     const data = JSON.parse(msg);
 
@@ -117,48 +83,30 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start.streamSid;
     }
 
-    if (data.event === "media") {
-      const payload = data.media?.payload;
-      if (!payload) return;
-
-      const openaiMsg = {
+    if (data.event === "media" && openaiReady) {
+      // 1️⃣ append audio
+      openaiSocket.send(JSON.stringify({
         type: "input_audio_buffer.append",
-        audio: payload
-      };
+        audio: data.media.payload
+      }));
 
-      if (openaiReady && openaiSocket.readyState === WebSocket.OPEN) {
-        openaiSocket.send(JSON.stringify(openaiMsg));
-      } else {
-        pendingAudio.push(openaiMsg);
-      }
+      // 2️⃣ COMMIT AUDIO  ← ← ← THIS WAS MISSING
+      openaiSocket.send(JSON.stringify({
+        type: "input_audio_buffer.commit"
+      }));
+
+      // 3️⃣ ASK FOR RESPONSE
+      openaiSocket.send(JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio"] }
+      }));
     }
 
     if (data.event === "stop") {
-      if (openaiSocket.readyState === WebSocket.OPEN) {
-        openaiSocket.close();
-      }
-      if (twilioSocket.readyState === WebSocket.OPEN) {
-        twilioSocket.close();
-      }
-    }
-  });
-
-  twilioSocket.on("close", () => {
-    if (openaiSocket.readyState === WebSocket.OPEN) {
       openaiSocket.close();
-    }
-  });
-
-  twilioSocket.on("error", (err) => {
-    console.error("Twilio WS error:", err);
-    if (openaiSocket.readyState === WebSocket.OPEN) {
-      openaiSocket.close();
+      twilioSocket.close();
     }
   });
 });
 
-/* ===== LISTEN ===== */
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Roy listening on ${PORT}`);
-});
+server.listen(process.env.PORT || 3000);
