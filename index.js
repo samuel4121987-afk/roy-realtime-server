@@ -26,28 +26,6 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 - Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
 - When the caller says filler words (e.g., “yes,” “uh-huh,” “okay,” “aha,” etc.) while you are speaking, do not pause—continue your response naturally, since listeners often vocalize agreement.
 - Only stop talking mid-sentence if the caller clearly asks a question or presents new information. Promptly listen, then answer their question directly and succinctly before resuming where you left off.
-
-## Noise and Multiple Voices
-- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: “I’m sorry, there’s some noise. Could you repeat that or find a quieter place?” Ask only this, then return to the conversation.
-- Never react to background chatter.
-
-## Language Adaptation
-- Default to English for all interactions. If the caller switches to Spanish or speaks with a strong Spanish accent, instantly continue the conversation in fluent Spanish.
-
-## Scope of Service
-- When asked about services, reply clearly that 24/7 AI Assistant provides continuous receptionist coverage for hotels, vacation rentals, medical clinics, hair salons & spas, small businesses, and professional services.
-- Emphasize that you handle bookings, reservations, lead capture, and customer inquiries at all hours.
-- Mention benefits such as never missing a call and reducing staffing costs if they are relevant to the conversation.
-- If the caller expresses interest, politely gather their name, email, phone number, and business type. Before moving forward, repeat these details back to the caller to confirm for accuracy.
-
-## Ending the Call
-- Before ending the conversation, confirm any collected contact information by repeating it back to the caller for verification.
-- When closing, use a friendly, casual farewell suited to the tone of the call, such as: “Thank you for calling. Have a great day.”
-
-## Prohibited Topics
-- Never discuss, reveal, or imply that you are an AI, use artificial intelligence, language models, or technology. At all times, maintain the persona of Roy, a genuine human receptionist.
-
-Always follow these instructions for every call without exception.
 `.trim();
 
 const app = express();
@@ -71,7 +49,6 @@ function twimlResponse(req) {
 </Response>`;
 }
 
-// Twilio can be configured as GET or POST; support both.
 app.all("/incoming-call", (req, res) => {
   res.status(200).type("text/xml").send(twimlResponse(req));
 });
@@ -79,12 +56,37 @@ app.all("/incoming-call", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/media-stream" });
 
+/* ---------------------------
+   SMART BARGE-IN CONFIG
+---------------------------- */
+// Expand this list as you like.
+const FILLER_REGEX = /^\s*(?:y(?:eah|ep|up|a)?|yes|ok(?:ay)?|okay|aha|uh\-?huh|mm+|mhm+|right|sure|got it|i see|alright|vale|sí|si|aja|ajá|claro)\s*[.!?…]*\s*$/i;
+
+// If transcript contains a "?" anywhere, treat as interruption.
+function isLikelyQuestion(text) {
+  return /\?/.test(text) || /\b(what|why|how|when|where|who|can you|could you|do you|are you|is it|tell me|explain)\b/i.test(text);
+}
+
+// If transcript has more than just filler, treat as interruption.
+function isFillerOnly(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (!t) return true;
+  return FILLER_REGEX.test(t);
+}
+
 wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
   let openaiOpen = false;
   const openaiQueue = [];
+
+  // Track assistant speaking so we only consider barge-in then.
+  let assistantSpeaking = false;
+
+  // We’ll collect short caller utterance transcripts while assistant is speaking.
+  // When we get a completed transcript, decide to cancel or ignore.
+  let pendingInterruptCheck = false;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -112,7 +114,7 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // Configure session (modalities MUST include text + audio)
+    // Enable transcription so we can distinguish filler vs real interruption.
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -121,33 +123,18 @@ wss.on("connection", (twilioSocket) => {
         output_audio_format: "g711_ulaw",
         voice: "alloy",
         temperature: 0.6,
+
+        // Keep your VAD behavior (works for turn-taking)
+        turn_detection: { type: "server_vad" },
+
+        // CRITICAL for smart barge-in
+        input_audio_transcription: { model: "whisper-1" },
+
         instructions: ROY_PROMPT,
       },
     });
 
     flushOpenAIQueue();
-
-    // If Twilio start already arrived, greet immediately.
-    if (streamSid) {
-      // First, add a user message to the conversation
-      sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Please greet the caller now."
-            }
-          ]
-        }
-      });
-      // Then trigger a response
-      sendToOpenAI({
-        type: "response.create"
-      });
-    }
   });
 
   openaiSocket.on("message", (raw) => {
@@ -163,6 +150,45 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
+    // Speaking state
+    if (evt.type === "response.created") assistantSpeaking = true;
+    if (evt.type === "response.done") assistantSpeaking = false;
+
+    // Caller transcription completion events:
+    // Different accounts may emit slightly different event names;
+    // handle the common ones defensively.
+    const transcriptText =
+      evt?.transcript ??
+      evt?.text ??
+      evt?.item?.content?.[0]?.transcript ??
+      evt?.item?.content?.[0]?.text;
+
+    const isTranscriptEvent =
+      evt.type === "conversation.item.input_audio_transcription.completed" ||
+      evt.type === "input_audio_transcription.completed" ||
+      (evt.type && evt.type.includes("transcription") && transcriptText);
+
+    if (isTranscriptEvent && pendingInterruptCheck && assistantSpeaking) {
+      const t = String(transcriptText || "").trim();
+      if (!t) return;
+
+      // Decide: cancel or ignore
+      const fillerOnly = isFillerOnly(t);
+      const questionLike = isLikelyQuestion(t);
+
+      if (!fillerOnly || questionLike) {
+        console.log("🛑 BARGE-IN (real):", t);
+        sendToOpenAI({ type: "response.cancel" });
+        assistantSpeaking = false;
+      } else {
+        console.log("✅ Ignoring filler:", t);
+      }
+
+      pendingInterruptCheck = false;
+      return;
+    }
+
+    // Audio back to Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(
@@ -187,8 +213,8 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
   const isCallerAudio = (track) => {
- if    (!track) return false; // reject audio without track 
-        return track === "inbound" || track === "inbound_track";
+    if (!track) return true; // allow missing track
+    return track === "inbound" || track === "inbound_track";
   };
 
   twilioSocket.on("message", (msg) => {
@@ -200,35 +226,39 @@ wss.on("connection", (twilioSocket) => {
     }
 
     if (data.event === "start") {
-      streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
+      streamSid = data.start?.streamSid || null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greet immediately as soon as both sides are ready (queued if OpenAI not open yet)
+      // Single deterministic greeting
       sendToOpenAI({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
           temperature: 0,
           instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-                    commit: true,
         },
       });
       return;
     }
 
     if (data.event === "media") {
-      const track = data.media && data.media.track;
+      const track = data.media?.track;
 
       if (!trackLogged) {
         trackLogged = true;
         console.log("ℹ️ Twilio media.track =", track || "(missing)");
       }
 
-      // Prevent feedback loop: only caller audio
       if (!isCallerAudio(track)) return;
 
-      const payload = data.media && data.media.payload;
+      const payload = data.media?.payload;
       if (!payload) return;
+
+      // If caller speaks while Roy is speaking, request a transcript-based interrupt check.
+      // We don't cancel immediately; we wait to see if it was filler-only.
+      if (assistantSpeaking) {
+        pendingInterruptCheck = true;
+      }
 
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
