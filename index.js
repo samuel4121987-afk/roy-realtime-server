@@ -122,12 +122,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-                turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
-        },
+                turn_detection: { type: "server_vad", threshold: 0.7, prefix_padding_ms: 300, silence_duration_ms: 700 },
       },
     });
 
@@ -260,9 +255,3 @@ wss.on("connection", (twilioSocket) => {
 
 const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => console.log("🚀 Listening on", PORT));
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
-        },
