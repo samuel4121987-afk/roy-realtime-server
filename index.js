@@ -71,6 +71,7 @@ function twimlResponse(req) {
 </Response>`;
 }
 
+// Twilio can be configured as GET or POST; support both.
 app.all("/incoming-call", (req, res) => {
   res.status(200).type("text/xml").send(twimlResponse(req));
 });
@@ -83,11 +84,6 @@ wss.on("connection", (twilioSocket) => {
 
   let streamSid = null;
   let openaiOpen = false;
-
-  // Two-phase control flags
-  let greeted = false;
-  let vadEnabled = false;
-
   const openaiQueue = [];
 
   function sendToOpenAI(obj) {
@@ -116,7 +112,7 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // PHASE 1: configure session WITHOUT VAD so Roy can speak first immediately
+    // Configure session (modalities MUST include text + audio)
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -126,43 +122,39 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-        // IMPORTANT: do NOT set turn_detection here
+                turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
+        },
       },
     });
 
     flushOpenAIQueue();
 
-    // If Twilio already started, greet now
+    // If Twilio start already arrived, greet immediately.
     if (streamSid) {
-      doGreetingAndThenEnableVAD();
-    }
-  });
-
-  function doGreetingAndThenEnableVAD() {
-    if (greeted) return;
-    greeted = true;
-
-    // 1) Force immediate greeting
-    sendToOpenAI({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        temperature: 0,
-        instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-      },
-    });
-
-    // 2) AFTER greeting is triggered, enable VAD for the rest of the call
-    if (!vadEnabled) {
-      vadEnabled = true;
+      // First, add a user message to the conversation
       sendToOpenAI({
-        type: "session.update",
-        session: {
-          turn_detection: { type: "server_vad" },
-        },
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "Please greet the caller now."
+            }
+          ]
+        }
+      });
+      // Then trigger a response
+      sendToOpenAI({
+        type: "response.create"
       });
     }
-  }
+  });
 
   openaiSocket.on("message", (raw) => {
     let evt;
@@ -200,11 +192,9 @@ wss.on("connection", (twilioSocket) => {
   });
 
   let trackLogged = false;
-
-  // allow missing track (prevents silence)
   const isCallerAudio = (track) => {
-    if (!track) return true;
-    return track === "inbound" || track === "inbound_track";
+ if    (!track) return false; // reject audio without track 
+        return track === "inbound" || track === "inbound_track";
   };
 
   twilioSocket.on("message", (msg) => {
@@ -219,8 +209,16 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // greet immediately (queued if OpenAI not open yet)
-      doGreetingAndThenEnableVAD();
+      // Greet immediately as soon as both sides are ready (queued if OpenAI not open yet)
+      sendToOpenAI({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          temperature: 0,
+          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+                    commit: true,
+        },
+      });
       return;
     }
 
@@ -232,6 +230,7 @@ wss.on("connection", (twilioSocket) => {
         console.log("ℹ️ Twilio media.track =", track || "(missing)");
       }
 
+      // Prevent feedback loop: only caller audio
       if (!isCallerAudio(track)) return;
 
       const payload = data.media && data.media.payload;
@@ -261,3 +260,9 @@ wss.on("connection", (twilioSocket) => {
 
 const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => console.log("🚀 Listening on", PORT));
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
+        },
