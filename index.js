@@ -121,33 +121,18 @@ wss.on("connection", (twilioSocket) => {
         output_audio_format: "g711_ulaw",
         voice: "alloy",
         temperature: 0.6,
+
+        // ✅ IMPORTANT: enables automatic listening + responding
+        turn_detection: { type: "server_vad" },
+
         instructions: ROY_PROMPT,
       },
     });
 
     flushOpenAIQueue();
 
-    // If Twilio start already arrived, greet immediately.
-    if (streamSid) {
-      // First, add a user message to the conversation
-      sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Please greet the caller now."
-            }
-          ]
-        }
-      });
-      // Then trigger a response
-      sendToOpenAI({
-        type: "response.create"
-      });
-    }
+    // ✅ DO NOT do a second greeting here.
+    // Greeting is done once in Twilio "start".
   });
 
   openaiSocket.on("message", (raw) => {
@@ -186,9 +171,11 @@ wss.on("connection", (twilioSocket) => {
   });
 
   let trackLogged = false;
+
+  // ✅ FIX: allow missing track (prevents silence)
   const isCallerAudio = (track) => {
- if    (!track) return false; // reject audio without track 
-        return track === "inbound" || track === "inbound_track";
+    if (!track) return true;
+    return track === "inbound" || track === "inbound_track";
   };
 
   twilioSocket.on("message", (msg) => {
@@ -203,14 +190,13 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greet immediately as soon as both sides are ready (queued if OpenAI not open yet)
+      // ✅ single greeting, deterministic
       sendToOpenAI({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
           temperature: 0,
           instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-                    commit: true,
         },
       });
       return;
@@ -224,7 +210,6 @@ wss.on("connection", (twilioSocket) => {
         console.log("ℹ️ Twilio media.track =", track || "(missing)");
       }
 
-      // Prevent feedback loop: only caller audio
       if (!isCallerAudio(track)) return;
 
       const payload = data.media && data.media.payload;
