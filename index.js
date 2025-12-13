@@ -50,6 +50,11 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 Always follow these instructions for every call without exception.
 `.trim();
 
+// Smart barge-in state
+let isRoySpeaking = false;
+let lastTranscriptTime = 0;
+const FILLER_WORDS = ['uh', 'um', 'hmm', 'ah', 'er', 'like', 'you know'];
+
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.urlencoded({ extended: false }));
@@ -122,6 +127,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
+              input_audio_transcription: { model: "whisper-1" },
       },
     });
 
@@ -161,6 +167,41 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "error") {
       console.error("❌ OpenAI error:", JSON.stringify(evt, null, 2));
       return;
+    }
+
+        // Track when Roy is speaking
+    if (evt.type === "response.audio_transcript.delta") {
+      isRoySpeaking = true;
+    }
+
+    // Track when Roy finishes speaking
+    if (evt.type === "response.done") {
+      isRoySpeaking = false;
+    }
+
+        // Detect user interruption (smart barge-in)
+    if (evt.type === "conversation.item.input_audio_transcription.completed") {
+      const transcript = evt.transcript?.toLowerCase() || "";
+      const now = Date.now();
+      const isFiller = FILLER_WORDS.some(word => transcript.includes(word));
+      
+      // Real interruption: not a filler AND Roy is speaking AND not too soon after last transcript
+      if (!isFiller && isRoySpeaking && (now - lastTranscriptTime) > 500) {
+        console.log("🛑 Real interruption detected, canceling Roy's response");
+        // Cancel current response
+        sendToOpenAI({
+          type: "response.cancel"
+        });
+        // Commit the audio buffer
+        sendToOpenAI({
+          type: "input_audio_buffer.commit"
+        });
+        // Create new response
+        sendToOpenAI({
+          type: "response.create"
+        });
+      }
+      lastTranscriptTime = now;
     }
 
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
