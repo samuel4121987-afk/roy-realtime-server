@@ -79,32 +79,6 @@ app.all("/incoming-call", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/media-stream" });
 
-/* ===========================
-   ROY INTERRUPTION LOGIC ONLY
-   (Everything else untouched)
-=========================== */
-
-// Treat these as “do NOT interrupt Roy”
-const FILLER_ONLY_REGEX =
-  /^\s*(?:y(?:eah|ep|up|a)?|yes|ok(?:ay)?|okay|aha|uh-?huh|mhm+|mm+|right|sure|got ?it|i ?see|alright|vale|si|sí|aja|ajá|claro|bueno)\s*[.!?…]*\s*$/i;
-
-function isFillerOnly(text) {
-  const t = (text || "").trim();
-  if (!t) return true;
-  return FILLER_ONLY_REGEX.test(t);
-}
-
-function looksLikeRealInterruption(text) {
-  const t = (text || "").trim();
-  if (!t) return false;
-  if (isFillerOnly(t)) return false;
-  // If it contains a question mark OR common question starters, interrupt.
-  if (/\?/.test(t)) return true;
-  if (/\b(what|why|how|when|where|who|can you|could you|do you|are you|is it|tell me|explain)\b/i.test(t)) return true;
-  // Any non-filler phrase => treat as real interruption.
-  return true;
-}
-
 wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
@@ -134,18 +108,11 @@ wss.on("connection", (twilioSocket) => {
     },
   });
 
-  // ===========================
-  // ROY speaking state
-  // ===========================
-  let assistantSpeaking = false;
-  let pendingInterruptCheck = false;
-
   openaiSocket.on("open", () => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
     // Configure session (modalities MUST include text + audio)
-    // ONLY ADDITION: input_audio_transcription for smart barge-in
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -155,9 +122,6 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-
-        // ✅ Needed so we can know if you said “ok/vale” or a real question
-        input_audio_transcription: { model: "whisper-1" },
       },
     });
 
@@ -174,14 +138,14 @@ wss.on("connection", (twilioSocket) => {
           content: [
             {
               type: "input_text",
-              text: "Please greet the caller now.",
-            },
-          ],
-        },
+              text: "Please greet the caller now."
+            }
+          ]
+        }
       });
       // Then trigger a response
       sendToOpenAI({
-        type: "response.create",
+        type: "response.create"
       });
     }
   });
@@ -199,50 +163,6 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Track assistant speaking so we only consider interrupting then
-    if (evt.type === "response.created") assistantSpeaking = true;
-    if (evt.type === "response.done") assistantSpeaking = false;
-    if (evt.type === "response.audio.delta") assistantSpeaking = true;
-
-    // ===========================
-    // SMART BARGE-IN: decide only after we get a transcript
-    // ===========================
-    const transcriptText =
-      evt?.transcript ??
-      evt?.text ??
-      evt?.item?.content?.[0]?.transcript ??
-      evt?.item?.content?.[0]?.text;
-
-    const isTranscriptionEvent =
-      evt.type === "conversation.item.input_audio_transcription.completed" ||
-      evt.type === "input_audio_transcription.completed" ||
-      (evt.type && evt.type.includes("transcription") && transcriptText);
-
-    if (isTranscriptionEvent && pendingInterruptCheck && assistantSpeaking) {
-      const t = String(transcriptText || "").trim();
-
-      if (looksLikeRealInterruption(t)) {
-        console.log("🛑 Interrupting Roy (real):", t);
-
-        // Stop Roy immediately
-        sendToOpenAI({ type: "response.cancel" });
-
-        // Commit whatever caller audio is in the buffer so OpenAI has the question
-        sendToOpenAI({ type: "input_audio_buffer.commit" });
-
-        // Generate a new response immediately (Roy answers)
-        sendToOpenAI({ type: "response.create" });
-
-        assistantSpeaking = false;
-      } else {
-        console.log("✅ Ignoring filler:", t);
-        // Do nothing; Roy continues speaking
-      }
-
-      pendingInterruptCheck = false;
-    }
-
-    // Forward audio from OpenAI back to Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(
@@ -267,8 +187,8 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
   const isCallerAudio = (track) => {
-    if (!track) return false; // keep your exact behavior
-    return track === "inbound" || track === "inbound_track";
+ if    (!track) return false; // reject audio without track 
+        return track === "inbound" || track === "inbound_track";
   };
 
   twilioSocket.on("message", (msg) => {
@@ -290,7 +210,7 @@ wss.on("connection", (twilioSocket) => {
           modalities: ["audio", "text"],
           temperature: 0,
           instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          commit: true, // leaving exactly as you had it
+                    commit: true,
         },
       });
       return;
@@ -309,12 +229,6 @@ wss.on("connection", (twilioSocket) => {
 
       const payload = data.media && data.media.payload;
       if (!payload) return;
-
-      // If caller speaks while Roy is speaking, don’t cancel yet.
-      // Wait for transcript to decide filler vs real interruption.
-      if (assistantSpeaking) {
-        pendingInterruptCheck = true;
-      }
 
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
