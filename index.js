@@ -187,8 +187,8 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
   const isCallerAudio = (track) => {
-    if (!track) return true; // some streams omit it
-    return track === "inbound" || track === "inbound_track";
+ if    (!track) return false; // reject audio without track 
+        return track === "inbound" || track === "inbound_track";
   };
 
   twilioSocket.on("message", (msg) => {
