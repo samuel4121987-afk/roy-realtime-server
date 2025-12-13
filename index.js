@@ -71,7 +71,6 @@ function twimlResponse(req) {
 </Response>`;
 }
 
-// Twilio can be configured as GET or POST; support both.
 app.all("/incoming-call", (req, res) => {
   res.status(200).type("text/xml").send(twimlResponse(req));
 });
@@ -84,6 +83,11 @@ wss.on("connection", (twilioSocket) => {
 
   let streamSid = null;
   let openaiOpen = false;
+
+  // Two-phase control flags
+  let greeted = false;
+  let vadEnabled = false;
+
   const openaiQueue = [];
 
   function sendToOpenAI(obj) {
@@ -112,7 +116,7 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // Configure session (modalities MUST include text + audio)
+    // PHASE 1: configure session WITHOUT VAD so Roy can speak first immediately
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -121,19 +125,44 @@ wss.on("connection", (twilioSocket) => {
         output_audio_format: "g711_ulaw",
         voice: "alloy",
         temperature: 0.6,
-
-        // ✅ IMPORTANT: enables automatic listening + responding
-        turn_detection: { type: "server_vad" },
-
         instructions: ROY_PROMPT,
+        // IMPORTANT: do NOT set turn_detection here
       },
     });
 
     flushOpenAIQueue();
 
-    // ✅ DO NOT do a second greeting here.
-    // Greeting is done once in Twilio "start".
+    // If Twilio already started, greet now
+    if (streamSid) {
+      doGreetingAndThenEnableVAD();
+    }
   });
+
+  function doGreetingAndThenEnableVAD() {
+    if (greeted) return;
+    greeted = true;
+
+    // 1) Force immediate greeting
+    sendToOpenAI({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        temperature: 0,
+        instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+      },
+    });
+
+    // 2) AFTER greeting is triggered, enable VAD for the rest of the call
+    if (!vadEnabled) {
+      vadEnabled = true;
+      sendToOpenAI({
+        type: "session.update",
+        session: {
+          turn_detection: { type: "server_vad" },
+        },
+      });
+    }
+  }
 
   openaiSocket.on("message", (raw) => {
     let evt;
@@ -172,7 +201,7 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
 
-  // ✅ FIX: allow missing track (prevents silence)
+  // allow missing track (prevents silence)
   const isCallerAudio = (track) => {
     if (!track) return true;
     return track === "inbound" || track === "inbound_track";
@@ -190,15 +219,8 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ single greeting, deterministic
-      sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-        },
-      });
+      // greet immediately (queued if OpenAI not open yet)
+      doGreetingAndThenEnableVAD();
       return;
     }
 
