@@ -19,8 +19,8 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 - Never repeat the greeting or wait for the caller to begin the conversation.
 
 ## Tone and Style
-- Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
-- Maintain a confident, friendly, and relaxed tone. Do not sound robotic or overly formal. Pace yourself steadily with natural intonation at all times.
+- Speak in a natural male voice with a QUICK, ENERGETIC pace. Keep all responses SHORT (one or two sentences max), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
+- Maintain a confident, friendly, and conversational tone. Speak at a BRISK pace like a real person - NOT slow or robotic. Be direct and to the point.
 
 ## Listening and Interruptions - CRITICAL
 - Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
@@ -136,7 +136,7 @@ wss.on("connection", (twilioSocket) => {
   let isAISpeaking = false;
   let pendingInterruption = false;
   let aiSpeakingStartTime = null;
-  const INTERRUPTION_GRACE_PERIOD = 1500; // 1.5 seconds grace period
+  const INTERRUPTION_GRACE_PERIOD = 800; // 0.8 seconds grace period - faster interruption
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -172,15 +172,16 @@ wss.on("connection", (twilioSocket) => {
         modalities: ["text", "audio"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        voice: "echo", // Changed from "alloy" to "echo" for better male voice
-        temperature: 0.8, // Increased from 0.6 for more natural conversations
+        voice: "echo", // Male voice
+        temperature: 0.7, // Balanced for natural but consistent responses
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 700
+          threshold: 0.4, // More sensitive - detects speech faster
+          prefix_padding_ms: 200, // Shorter padding - faster detection
+          silence_duration_ms: 500 // Shorter silence - quicker response
         },
+        max_response_output_tokens: 150, // Keep responses concise
         input_audio_transcription: { model: "whisper-1" },
       },
     });
