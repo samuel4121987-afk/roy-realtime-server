@@ -135,6 +135,8 @@ wss.on("connection", (twilioSocket) => {
   let lastUserTranscript = '';
   let isAISpeaking = false;
   let pendingInterruption = false;
+  let aiSpeakingStartTime = null;
+  const INTERRUPTION_GRACE_PERIOD = 1500; // 1.5 seconds grace period
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -173,7 +175,12 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo", // Changed from "alloy" to "echo" for better male voice
         temperature: 0.8, // Increased from 0.6 for more natural conversations
         instructions: ROY_PROMPT,
-        turn_detection: null,  // Disable automatic turn detection - we handle it manually
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 700
+        },
         input_audio_transcription: { model: "whisper-1" },
       },
     });
@@ -203,9 +210,16 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  // Handle interruptions - AGGRESSIVE IMMEDIATE INTERRUPTION
+  // Handle interruptions - WITH GRACE PERIOD
   function handleSpeechStartedEvent() {
     if (isAISpeaking) {
+      // Check if we're still in grace period
+      const timeSinceAIStarted = Date.now() - aiSpeakingStartTime;
+      if (timeSinceAIStarted < INTERRUPTION_GRACE_PERIOD) {
+        console.log(`⏳ Speech detected but in grace period (${timeSinceAIStarted}ms) - ignoring`);
+        return;
+      }
+      
       console.log("👂 User started speaking while AI is talking - STOPPING IMMEDIATELY");
       
       // IMMEDIATELY cancel the response - don't wait for transcript
@@ -273,11 +287,6 @@ wss.on("connection", (twilioSocket) => {
       console.log("🗣️ Speech detected!");
       handleSpeechStartedEvent();
       
-      // Commit the audio buffer to process what user is saying
-      sendToOpenAI({
-        type: "input_audio_buffer.commit"
-      });
-      
       // Also send a clear command to stop any queued audio
       if (isAISpeaking) {
         twilioSocket.send(JSON.stringify({
@@ -286,30 +295,21 @@ wss.on("connection", (twilioSocket) => {
         }));
       }
     }
-    
-    // Handle speech stopped - create response
-    if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log("🤐 Speech stopped - creating response");
-      sendToOpenAI({
-        type: "input_audio_buffer.commit"
-      });
-      sendToOpenAI({
-        type: "response.create"
-      });
-    }
 
     // Track when AI starts speaking
     if (evt.type === "response.audio.started" || evt.type === "response.audio.delta") {
       if (!isAISpeaking) {
         isAISpeaking = true;
+        aiSpeakingStartTime = Date.now(); // Set grace period start time
         responseStartTimestamp = latestMediaTimestamp;
-        console.log("🎙️ AI started speaking");
+        console.log("🎙️ AI started speaking - grace period active");
       }
     }
 
     // Track when AI finishes speaking
     if (evt.type === "response.audio.done" || evt.type === "response.done") {
       isAISpeaking = false;
+      aiSpeakingStartTime = null;
       responseStartTimestamp = null;
       lastAssistantItem = null;
       pendingInterruption = false;
