@@ -85,6 +85,9 @@ wss.on("connection", (twilioSocket) => {
   let streamSid = null;
   let openaiOpen = false;
   const openaiQueue = [];
+  let isRoySpeaking = false;
+  let currentResponseId = null;
+  const FILLER_WORDS = ['uh', 'um', 'hmm', 'ah', 'er', 'yeah', 'yes', 'okay', 'ok', 'mhm', 'uh-huh'];
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -128,6 +131,7 @@ wss.on("connection", (twilioSocket) => {
           prefix_padding_ms: 300,
           silence_duration_ms: 500
         },
+        input_audio_transcription: { model: "whisper-1" },
       },
     });
 
@@ -167,6 +171,55 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "error") {
       console.error("❌ OpenAI error:", JSON.stringify(evt, null, 2));
       return;
+    }
+
+    // Track when Roy starts speaking
+    if (evt.type === "response.audio.started") {
+      isRoySpeaking = true;
+      console.log("🎙️ Roy started speaking");
+    }
+
+    // Track when Roy stops speaking
+    if (evt.type === "response.audio.done") {
+      isRoySpeaking = false;
+      currentResponseId = null;
+      console.log("✅ Roy finished speaking");
+    }
+
+    // Track response ID
+    if (evt.type === "response.created") {
+      currentResponseId = evt.response.id;
+    }
+
+    // Handle caller transcription for smart interruption
+    if (evt.type === "conversation.item.input_audio_transcription.completed") {
+      const transcript = (evt.transcript || "").toLowerCase().trim();
+      console.log("👤 Caller said:", transcript);
+
+      // Check if it's a filler word
+      const isFiller = FILLER_WORDS.some(filler => transcript === filler || transcript.startsWith(filler + ' '));
+
+      // If Roy is speaking AND caller said something that's NOT a filler, interrupt Roy
+      if (isRoySpeaking && !isFiller && transcript.length > 0) {
+        console.log("🛑 Real interruption detected - stopping Roy");
+        
+        // Cancel current response
+        if (currentResponseId) {
+          sendToOpenAI({
+            type: "response.cancel"
+          });
+        }
+
+        // Commit the audio buffer
+        sendToOpenAI({
+          type: "input_audio_buffer.commit"
+        });
+
+        // Create new response
+        sendToOpenAI({
+          type: "response.create"
+        });
+      }
     }
 
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
