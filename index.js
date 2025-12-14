@@ -22,11 +22,13 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 - Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
 - Maintain a confident, friendly, and relaxed tone. Do not sound robotic or overly formal. Pace yourself steadily with natural intonation at all times.
 
-## Listening and Interruptions
+## Listening and Interruptions - CRITICAL
 - Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
-- When the caller says brief filler words or acknowledgments (e.g., "yes," "uh-huh," "okay," "aha," "si," "vale," "ok") while you are speaking, these are signs of active listening. Continue your response naturally without pausing.
-- HOWEVER, if the caller asks a question or says something substantive (more than just a filler word), IMMEDIATELY STOP speaking and listen to their full question or statement.
-- Once they finish, answer their question directly and concisely, then you may continue with your previous point if relevant.
+- The MOMENT you detect the caller starting to speak (not just filler words), you MUST STOP talking IMMEDIATELY. Do not finish your sentence. Do not continue speaking.
+- After you stop, listen carefully to determine if it's a real question or just a brief acknowledgment.
+- If it's a real question or statement, answer it directly and concisely.
+- If it was just a brief filler word like "yes," "uh-huh," "okay," "aha," "si," "vale," you may briefly continue your previous point.
+- NEVER talk over the caller. Stopping immediately when they speak is more important than finishing your thought.
 
 ## Noise and Multiple Voices
 - Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: "I'm sorry, there's some noise. Could you repeat that or find a quieter place?" Ask only this, then return to the conversation.
@@ -171,12 +173,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo", // Changed from "alloy" to "echo" for better male voice
         temperature: 0.8, // Increased from 0.6 for more natural conversations
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 700  // Increased to reduce false interruptions from filler words
-        },
+        turn_detection: null,  // Disable automatic turn detection - we handle it manually
         input_audio_transcription: { model: "whisper-1" },
       },
     });
@@ -206,50 +203,52 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  // Handle interruptions - IMPROVED WITH FILLER WORD DETECTION
+  // Handle interruptions - AGGRESSIVE IMMEDIATE INTERRUPTION
   function handleSpeechStartedEvent() {
     if (isAISpeaking) {
-      console.log("👂 User started speaking while AI is talking - waiting for transcript...");
+      console.log("👂 User started speaking while AI is talking - STOPPING IMMEDIATELY");
+      
+      // IMMEDIATELY cancel the response - don't wait for transcript
+      sendToOpenAI({
+        type: "response.cancel"
+      });
+      
+      // Clear all audio from Twilio queue
+      markQueue.length = 0;
+      
+      // Mark that we're waiting to check if it's a filler word
       pendingInterruption = true;
     }
   }
 
   function handleInterruptionWithTranscript(transcript) {
-    if (!pendingInterruption || !isAISpeaking) {
-      pendingInterruption = false;
+    if (!pendingInterruption) {
       return;
     }
 
     // Check if it's just filler words
     if (isOnlyFillerWords(transcript)) {
-      console.log(`💬 Filler detected: "${transcript}" - NOT interrupting AI`);
+      console.log(`💬 Filler detected: "${transcript}" - AI already stopped, will resume if needed`);
       pendingInterruption = false;
+      // Don't resume - let the natural flow continue
       return;
     }
 
-    // Real interruption - stop the AI
-    console.log(`🛑 Real interruption detected: "${transcript}" - stopping AI`);
+    // Real interruption confirmed
+    console.log(`🛑 Real interruption confirmed: "${transcript}" - AI stopped`);
     
-    if (lastAssistantItem) {
-      // Cancel the current response
+    // Truncate the conversation item if we have it
+    if (lastAssistantItem && responseStartTimestamp) {
+      const elapsedTime = latestMediaTimestamp - responseStartTimestamp;
       sendToOpenAI({
-        type: "response.cancel"
+        type: "conversation.item.truncate",
+        item_id: lastAssistantItem,
+        content_index: 0,
+        audio_end_ms: elapsedTime
       });
-      
-      // Also truncate if we have timing info
-      if (responseStartTimestamp) {
-        const elapsedTime = latestMediaTimestamp - responseStartTimestamp;
-        sendToOpenAI({
-          type: "conversation.item.truncate",
-          item_id: lastAssistantItem,
-          content_index: 0,
-          audio_end_ms: elapsedTime
-        });
-      }
     }
     
     // Clear state
-    markQueue.length = 0;
     lastAssistantItem = null;
     responseStartTimestamp = null;
     isAISpeaking = false;
@@ -269,9 +268,34 @@ wss.on("connection", (twilioSocket) => {
       console.log(`📊 Event: ${evt.type}`);
     }
 
-    // Handle speech started (interruption detection)
+    // Handle speech started (interruption detection) - IMMEDIATE ACTION
     if (evt.type === "input_audio_buffer.speech_started") {
+      console.log("🗣️ Speech detected!");
       handleSpeechStartedEvent();
+      
+      // Commit the audio buffer to process what user is saying
+      sendToOpenAI({
+        type: "input_audio_buffer.commit"
+      });
+      
+      // Also send a clear command to stop any queued audio
+      if (isAISpeaking) {
+        twilioSocket.send(JSON.stringify({
+          event: "clear",
+          streamSid: streamSid
+        }));
+      }
+    }
+    
+    // Handle speech stopped - create response
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      console.log("🤐 Speech stopped - creating response");
+      sendToOpenAI({
+        type: "input_audio_buffer.commit"
+      });
+      sendToOpenAI({
+        type: "response.create"
+      });
     }
 
     // Track when AI starts speaking
