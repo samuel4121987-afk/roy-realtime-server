@@ -125,7 +125,12 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-        turn_detection: null,
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 700
+        },
         input_audio_transcription: { model: "whisper-1" },
       },
     });
@@ -190,7 +195,7 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log("👤 Caller started speaking");
       
-      // Always stop Roy immediately when caller starts speaking
+      // Stop Roy immediately when caller starts speaking
       if (isRoySpeaking && currentResponseId) {
         console.log("🛑 Stopping Roy immediately");
         sendToOpenAI({
@@ -198,11 +203,6 @@ wss.on("connection", (twilioSocket) => {
         });
         isRoySpeaking = false;
       }
-    }
-
-    // Handle when speech stops
-    if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log("👤 Caller stopped speaking");
     }
 
     // Handle caller transcription to check if it's a filler word
@@ -214,17 +214,9 @@ wss.on("connection", (twilioSocket) => {
       const isFiller = FILLER_WORDS.some(filler => transcript === filler || transcript.startsWith(filler + ' '));
 
       if (isFiller) {
-        console.log("✅ Filler word detected - ignoring");
-        // Don't respond to filler words
-      } else if (transcript.length > 0) {
-        console.log("❓ Real question/statement - Roy will respond");
-        // Commit the audio and create response
-        sendToOpenAI({
-          type: "input_audio_buffer.commit"
-        });
-        sendToOpenAI({
-          type: "response.create"
-        });
+        console.log("✅ Filler word detected - ignoring, won't trigger response");
+      } else {
+        console.log("❓ Real question/statement detected");
       }
     }
 
