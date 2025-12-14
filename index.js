@@ -87,7 +87,7 @@ wss.on("connection", (twilioSocket) => {
   const openaiQueue = [];
   let isRoySpeaking = false;
   let currentResponseId = null;
-  const FILLER_WORDS = ['uh', 'um', 'hmm', 'ah', 'er', 'yeah', 'yes', 'okay', 'ok', 'mhm', 'uh-huh'];
+  const FILLER_WORDS = ['uh', 'um', 'hmm', 'ah', 'er', 'yeah', 'yes', 'okay', 'ok', 'mhm', 'uh-huh', 'aha', 'si', 'vale', 'ajá', 'sí'];
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -125,12 +125,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
-        },
+        turn_detection: null,
         input_audio_transcription: { model: "whisper-1" },
       },
     });
@@ -191,7 +186,26 @@ wss.on("connection", (twilioSocket) => {
       currentResponseId = evt.response.id;
     }
 
-    // Handle caller transcription for smart interruption
+    // Handle speech detection - when user starts speaking
+    if (evt.type === "input_audio_buffer.speech_started") {
+      console.log("👤 Caller started speaking");
+      
+      // Always stop Roy immediately when caller starts speaking
+      if (isRoySpeaking && currentResponseId) {
+        console.log("🛑 Stopping Roy immediately");
+        sendToOpenAI({
+          type: "response.cancel"
+        });
+        isRoySpeaking = false;
+      }
+    }
+
+    // Handle when speech stops
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      console.log("👤 Caller stopped speaking");
+    }
+
+    // Handle caller transcription to check if it's a filler word
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").toLowerCase().trim();
       console.log("👤 Caller said:", transcript);
@@ -199,23 +213,15 @@ wss.on("connection", (twilioSocket) => {
       // Check if it's a filler word
       const isFiller = FILLER_WORDS.some(filler => transcript === filler || transcript.startsWith(filler + ' '));
 
-      // If Roy is speaking AND caller said something that's NOT a filler, interrupt Roy
-      if (isRoySpeaking && !isFiller && transcript.length > 0) {
-        console.log("🛑 Real interruption detected - stopping Roy");
-        
-        // Cancel current response
-        if (currentResponseId) {
-          sendToOpenAI({
-            type: "response.cancel"
-          });
-        }
-
-        // Commit the audio buffer
+      if (isFiller) {
+        console.log("✅ Filler word detected - ignoring");
+        // Don't respond to filler words
+      } else if (transcript.length > 0) {
+        console.log("❓ Real question/statement - Roy will respond");
+        // Commit the audio and create response
         sendToOpenAI({
           type: "input_audio_buffer.commit"
         });
-
-        // Create new response
         sendToOpenAI({
           type: "response.create"
         });
