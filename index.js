@@ -136,7 +136,11 @@ wss.on("connection", (twilioSocket) => {
   let isAISpeaking = false;
   let pendingInterruption = false;
   let aiSpeakingStartTime = null;
-  const INTERRUPTION_GRACE_PERIOD = 800; // 0.8 seconds grace period - faster interruption
+  let lastSpeechDetectionTime = null;
+  let speechDetectionCount = 0;
+  const INTERRUPTION_GRACE_PERIOD = 800; // 0.8 seconds grace period at start
+  const SPEECH_CONFIRMATION_THRESHOLD = 2; // Need 2 detections to confirm real speech
+  const SPEECH_DETECTION_WINDOW = 400; // Within 400ms window
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -211,28 +215,50 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  // Handle interruptions - WITH GRACE PERIOD
+  // Handle interruptions - WITH GRACE PERIOD AND CONFIRMATION
   function handleSpeechStartedEvent() {
     if (isAISpeaking) {
-      // Check if we're still in grace period
-      const timeSinceAIStarted = Date.now() - aiSpeakingStartTime;
+      const now = Date.now();
+      const timeSinceAIStarted = now - aiSpeakingStartTime;
+      
+      // Check if we're still in initial grace period
       if (timeSinceAIStarted < INTERRUPTION_GRACE_PERIOD) {
         console.log(`⏳ Speech detected but in grace period (${timeSinceAIStarted}ms) - ignoring`);
         return;
       }
       
-      console.log("👂 User started speaking while AI is talking - STOPPING IMMEDIATELY");
-      
-      // IMMEDIATELY cancel the response - don't wait for transcript
-      sendToOpenAI({
-        type: "response.cancel"
-      });
-      
-      // Clear all audio from Twilio queue
-      markQueue.length = 0;
-      
-      // Mark that we're waiting to check if it's a filler word
-      pendingInterruption = true;
+      // After grace period, require multiple detections to confirm real speech
+      if (lastSpeechDetectionTime && (now - lastSpeechDetectionTime) < SPEECH_DETECTION_WINDOW) {
+        // Multiple detections within window - this is likely real speech
+        speechDetectionCount++;
+        console.log(`🔍 Speech detection #${speechDetectionCount} within window`);
+        
+        if (speechDetectionCount >= SPEECH_CONFIRMATION_THRESHOLD) {
+          console.log("👂 User started speaking while AI is talking - STOPPING IMMEDIATELY");
+          
+          // IMMEDIATELY cancel the response
+          sendToOpenAI({
+            type: "response.cancel"
+          });
+          
+          // Clear all audio from Twilio queue
+          markQueue.length = 0;
+          
+          // Mark that we're waiting to check if it's a filler word
+          pendingInterruption = true;
+          
+          // Reset detection tracking
+          speechDetectionCount = 0;
+          lastSpeechDetectionTime = null;
+        } else {
+          lastSpeechDetectionTime = now;
+        }
+      } else {
+        // First detection or outside window - start new tracking
+        console.log(`🔍 Speech detection #1 - waiting for confirmation`);
+        speechDetectionCount = 1;
+        lastSpeechDetectionTime = now;
+      }
     }
   }
 
@@ -303,6 +329,8 @@ wss.on("connection", (twilioSocket) => {
         isAISpeaking = true;
         aiSpeakingStartTime = Date.now(); // Set grace period start time
         responseStartTimestamp = latestMediaTimestamp;
+        speechDetectionCount = 0; // Reset detection counter
+        lastSpeechDetectionTime = null; // Reset detection timer
         console.log("🎙️ AI started speaking - grace period active");
       }
     }
@@ -314,6 +342,8 @@ wss.on("connection", (twilioSocket) => {
       responseStartTimestamp = null;
       lastAssistantItem = null;
       pendingInterruption = false;
+      speechDetectionCount = 0; // Reset detection counter
+      lastSpeechDetectionTime = null; // Reset detection timer
       console.log("✅ AI finished speaking");
     }
 
