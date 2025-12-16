@@ -136,11 +136,7 @@ wss.on("connection", (twilioSocket) => {
   let isAISpeaking = false;
   let pendingInterruption = false;
   let aiSpeakingStartTime = null;
-  let lastSpeechDetectionTime = null;
-  let speechDetectionCount = 0;
   const INTERRUPTION_GRACE_PERIOD = 800; // 0.8 seconds grace period at start
-  const SPEECH_CONFIRMATION_THRESHOLD = 2; // Need 2 detections to confirm real speech
-  const SPEECH_DETECTION_WINDOW = 400; // Within 400ms window
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -179,12 +175,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo", // Male voice
         temperature: 0.7, // Balanced for natural but consistent responses
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.4, // More sensitive - detects speech faster
-          prefix_padding_ms: 200, // Shorter padding - faster detection
-          silence_duration_ms: 500 // Shorter silence - quicker response
-        },
+        turn_detection: null, // Disable automatic turn detection - we handle it manually
         max_response_output_tokens: 150, // Keep responses concise
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -215,7 +206,7 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  // Handle interruptions - WITH GRACE PERIOD AND CONFIRMATION
+  // Handle interruptions - WAIT FOR TRANSCRIPT BEFORE DECIDING
   function handleSpeechStartedEvent() {
     if (isAISpeaking) {
       const now = Date.now();
@@ -227,38 +218,11 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
       
-      // After grace period, require multiple detections to confirm real speech
-      if (lastSpeechDetectionTime && (now - lastSpeechDetectionTime) < SPEECH_DETECTION_WINDOW) {
-        // Multiple detections within window - this is likely real speech
-        speechDetectionCount++;
-        console.log(`🔍 Speech detection #${speechDetectionCount} within window`);
-        
-        if (speechDetectionCount >= SPEECH_CONFIRMATION_THRESHOLD) {
-          console.log("👂 User started speaking while AI is talking - STOPPING IMMEDIATELY");
-          
-          // IMMEDIATELY cancel the response
-          sendToOpenAI({
-            type: "response.cancel"
-          });
-          
-          // Clear all audio from Twilio queue
-          markQueue.length = 0;
-          
-          // Mark that we're waiting to check if it's a filler word
-          pendingInterruption = true;
-          
-          // Reset detection tracking
-          speechDetectionCount = 0;
-          lastSpeechDetectionTime = null;
-        } else {
-          lastSpeechDetectionTime = now;
-        }
-      } else {
-        // First detection or outside window - start new tracking
-        console.log(`🔍 Speech detection #1 - waiting for confirmation`);
-        speechDetectionCount = 1;
-        lastSpeechDetectionTime = now;
-      }
+      // Mark that we detected speech and are waiting for transcript
+      console.log("🗣️ Speech detected while AI speaking - waiting for transcript to decide");
+      pendingInterruption = true;
+      
+      // DO NOT cancel response yet - wait for transcript to determine if it's real speech
     }
   }
 
@@ -269,14 +233,26 @@ wss.on("connection", (twilioSocket) => {
 
     // Check if it's just filler words
     if (isOnlyFillerWords(transcript)) {
-      console.log(`💬 Filler detected: "${transcript}" - AI already stopped, will resume if needed`);
+      console.log(`💬 Filler detected: "${transcript}" - letting Roy continue`);
       pendingInterruption = false;
-      // Don't resume - let the natural flow continue
+      // Don't interrupt - Roy keeps talking
       return;
     }
 
-    // Real interruption confirmed
-    console.log(`🛑 Real interruption confirmed: "${transcript}" - AI stopped`);
+    // Real interruption confirmed - NOW we stop Roy
+    console.log(`🛑 Real interruption confirmed: "${transcript}" - STOPPING Roy NOW`);
+    
+    // Cancel the current response
+    sendToOpenAI({
+      type: "response.cancel"
+    });
+    
+    // Clear all audio from Twilio queue
+    twilioSocket.send(JSON.stringify({
+      event: "clear",
+      streamSid: streamSid
+    }));
+    markQueue.length = 0;
     
     // Truncate the conversation item if we have it
     if (lastAssistantItem && responseStartTimestamp) {
@@ -309,17 +285,30 @@ wss.on("connection", (twilioSocket) => {
       console.log(`📊 Event: ${evt.type}`);
     }
 
-    // Handle speech started (interruption detection) - IMMEDIATE ACTION
+    // Handle speech started (interruption detection)
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log("🗣️ Speech detected!");
       handleSpeechStartedEvent();
+    }
+    
+    // Handle speech stopped - manually commit and trigger response
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      console.log("🤫 Speech stopped - committing audio buffer");
       
-      // Also send a clear command to stop any queued audio
-      if (isAISpeaking) {
-        twilioSocket.send(JSON.stringify({
-          event: "clear",
-          streamSid: streamSid
-        }));
+      // Only process if AI is not currently speaking or if we're handling an interruption
+      if (!isAISpeaking || pendingInterruption) {
+        // Commit the audio buffer
+        sendToOpenAI({
+          type: "input_audio_buffer.commit"
+        });
+        
+        // If this was during AI speaking, wait for transcript before responding
+        // Otherwise, trigger a response immediately
+        if (!pendingInterruption) {
+          sendToOpenAI({
+            type: "response.create"
+          });
+        }
       }
     }
 
@@ -329,8 +318,6 @@ wss.on("connection", (twilioSocket) => {
         isAISpeaking = true;
         aiSpeakingStartTime = Date.now(); // Set grace period start time
         responseStartTimestamp = latestMediaTimestamp;
-        speechDetectionCount = 0; // Reset detection counter
-        lastSpeechDetectionTime = null; // Reset detection timer
         console.log("🎙️ AI started speaking - grace period active");
       }
     }
@@ -342,8 +329,6 @@ wss.on("connection", (twilioSocket) => {
       responseStartTimestamp = null;
       lastAssistantItem = null;
       pendingInterruption = false;
-      speechDetectionCount = 0; // Reset detection counter
-      lastSpeechDetectionTime = null; // Reset detection timer
       console.log("✅ AI finished speaking");
     }
 
@@ -380,7 +365,16 @@ wss.on("connection", (twilioSocket) => {
       console.log(`👤 User said: "${lastUserTranscript}"`);
       
       // Check if this was an interruption
+      const wasInterruption = pendingInterruption;
       handleInterruptionWithTranscript(lastUserTranscript);
+      
+      // If it was a real interruption (not filler), trigger response to user's question
+      if (wasInterruption && !pendingInterruption && !isAISpeaking) {
+        console.log("➡️ Triggering response to user's interruption");
+        sendToOpenAI({
+          type: "response.create"
+        });
+      }
     }
 
     if (evt.type === "response.text.done") {
