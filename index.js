@@ -136,7 +136,7 @@ wss.on("connection", (twilioSocket) => {
   let isAISpeaking = false;
   let pendingInterruption = false;
   let aiSpeakingStartTime = null;
-  const INTERRUPTION_GRACE_PERIOD = 800; // 0.8 seconds grace period at start
+  const INTERRUPTION_GRACE_PERIOD = 1500; // 1.5 seconds grace period at start
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -223,6 +223,9 @@ wss.on("connection", (twilioSocket) => {
       pendingInterruption = true;
       
       // DO NOT cancel response yet - wait for transcript to determine if it's real speech
+    } else {
+      // AI is not speaking, so this is normal user speech - no special handling needed
+      console.log("👂 User started speaking (AI not speaking)");
     }
   }
 
@@ -295,20 +298,25 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "input_audio_buffer.speech_stopped") {
       console.log("🤫 Speech stopped - committing audio buffer");
       
-      // Only process if AI is not currently speaking or if we're handling an interruption
-      if (!isAISpeaking || pendingInterruption) {
-        // Commit the audio buffer
+      // Always commit the audio buffer to get the transcript
+      sendToOpenAI({
+        type: "input_audio_buffer.commit"
+      });
+      
+      // Only trigger response if AI is NOT currently speaking
+      if (!isAISpeaking) {
+        console.log("➡️ AI not speaking - triggering response");
         sendToOpenAI({
-          type: "input_audio_buffer.commit"
+          type: "response.create"
         });
-        
-        // If this was during AI speaking, wait for transcript before responding
-        // Otherwise, trigger a response immediately
-        if (!pendingInterruption) {
-          sendToOpenAI({
-            type: "response.create"
-          });
-        }
+      } else if (pendingInterruption) {
+        // If we have a pending interruption, we already committed above
+        // Wait for transcript to confirm it's real speech before responding
+        console.log("⏳ Pending interruption - waiting for transcript");
+      } else {
+        // AI is speaking but no interruption was detected (still in grace period or no speech_started)
+        // This might be background noise - ignore it
+        console.log("⏭️ AI speaking, no interruption detected - ignoring");
       }
     }
 
