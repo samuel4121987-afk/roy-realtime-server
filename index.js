@@ -71,7 +71,34 @@ const LOG_EVENT_TYPES = [
   'conversation.item.created'
 ];
 
-// turn_detection with server_vad handles all speech detection automatically
+// Expanded filler words list including Spanish
+const FILLER_WORDS = [
+  'uh', 'um', 'hmm', 'ah', 'er', 'like', 'you know',
+  'aha', 'yes', 'yeah', 'yep', 'okay', 'ok', 'sure', 'right',
+  'si', 'ya', 'vale', 'bueno', 'claro', 'uh-huh', 'mm-hmm', 'mhm', 'okey',
+  'i see', 'got it', 'alright', 'entiendo', 'perfecto'
+];
+
+// Function to check if text is just filler words
+function isOnlyFillerWords(text) {
+  if (!text || text.trim().length === 0) return true;
+  
+  const normalized = text.toLowerCase().trim();
+  
+  // Check if the entire phrase is a filler phrase
+  if (FILLER_WORDS.includes(normalized)) return true;
+  
+  const words = normalized.split(/\s+/);
+  
+  // If more than 4 words, it's likely a real sentence
+  if (words.length > 4) return false;
+  
+  // Check if all words are filler words
+  return words.every(word => {
+    const cleanWord = word.replace(/[.,!?;:]/g, '');
+    return FILLER_WORDS.includes(cleanWord);
+  });
+}
 
 const app = express();
 app.set("trust proxy", 1);
@@ -116,6 +143,9 @@ wss.on("connection", (twilioSocket) => {
   const MAX_RECONNECT_ATTEMPTS = 3;
   let lastUserTranscript = '';
   let isAISpeaking = false;
+  let pendingInterruption = false;
+  let aiSpeakingStartTime = null;
+  const INTERRUPTION_GRACE_PERIOD = 1500; // 1.5 seconds grace period at start
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -154,12 +184,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo", // Male voice
         temperature: 0.7, // Balanced for natural but consistent responses
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
-        },
+        turn_detection: null, // Disabled - we handle it manually with filler word detection
         max_response_output_tokens: 150, // Keep responses concise
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -176,8 +201,74 @@ wss.on("connection", (twilioSocket) => {
     }
   });
 
-  // With turn_detection enabled, OpenAI handles interruptions automatically
-  // No manual interruption handling needed
+  // Handle interruptions - WAIT FOR TRANSCRIPT BEFORE DECIDING
+  function handleSpeechStartedEvent() {
+    if (isAISpeaking) {
+      const now = Date.now();
+      const timeSinceAIStarted = now - aiSpeakingStartTime;
+      
+      // Check if we're still in initial grace period
+      if (timeSinceAIStarted < INTERRUPTION_GRACE_PERIOD) {
+        console.log(`⏳ Speech detected but in grace period (${timeSinceAIStarted}ms) - ignoring`);
+        return;
+      }
+      
+      // Mark that we detected speech and are waiting for transcript
+      console.log("🗣️ Speech detected while AI speaking - waiting for transcript to decide");
+      pendingInterruption = true;
+      
+      // DO NOT cancel response yet - wait for transcript to determine if it's real speech
+    } else {
+      // AI is not speaking, so this is normal user speech - no special handling needed
+      console.log("👂 User started speaking (AI not speaking)");
+    }
+  }
+
+  function handleInterruptionWithTranscript(transcript) {
+    if (!pendingInterruption) {
+      return;
+    }
+
+    // Check if it's just filler words
+    if (isOnlyFillerWords(transcript)) {
+      console.log(`💬 Filler detected: "${transcript}" - letting Roy continue`);
+      pendingInterruption = false;
+      // Don't interrupt - Roy keeps talking
+      return;
+    }
+
+    // Real interruption confirmed - NOW we stop Roy
+    console.log(`🛑 Real interruption confirmed: "${transcript}" - STOPPING Roy NOW`);
+    
+    // Cancel the current response
+    sendToOpenAI({
+      type: "response.cancel"
+    });
+    
+    // Clear all audio from Twilio queue
+    twilioSocket.send(JSON.stringify({
+      event: "clear",
+      streamSid: streamSid
+    }));
+    markQueue.length = 0;
+    
+    // Truncate the conversation item if we have it
+    if (lastAssistantItem && responseStartTimestamp) {
+      const elapsedTime = latestMediaTimestamp - responseStartTimestamp;
+      sendToOpenAI({
+        type: "conversation.item.truncate",
+        item_id: lastAssistantItem,
+        content_index: 0,
+        audio_end_ms: elapsedTime
+      });
+    }
+    
+    // Clear state
+    lastAssistantItem = null;
+    responseStartTimestamp = null;
+    isAISpeaking = false;
+    pendingInterruption = false;
+  }
 
   openaiSocket.on("message", (raw) => {
     let evt;
@@ -192,16 +283,42 @@ wss.on("connection", (twilioSocket) => {
       console.log(`📊 Event: ${evt.type}`);
     }
 
-    // Handle speech started - turn_detection handles this automatically
+    // Handle speech started (interruption detection)
     if (evt.type === "input_audio_buffer.speech_started") {
-      console.log("🗣️ Speech detected - turn_detection handling");
+      console.log("🗣️ Speech detected!");
+      handleSpeechStartedEvent();
     }
     
-    // Handle speech stopped - turn_detection handles this automatically now
+    // Handle speech stopped - manually commit buffer
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log("🤫 Speech stopped - turn_detection will handle response");
-      // With server_vad enabled, OpenAI automatically commits buffer and triggers response
-      // No manual intervention needed
+      console.log("🤫 Speech stopped - committing audio buffer");
+      
+      // Always commit the audio buffer to get the transcript
+      sendToOpenAI({
+        type: "input_audio_buffer.commit"
+      });
+      
+      // Note: We'll trigger the response in the committed event handler
+    }
+    
+    // Handle buffer committed - trigger response after commit completes
+    if (evt.type === "input_audio_buffer.committed") {
+      console.log("✅ Audio buffer committed");
+      
+      // Only trigger response if AI is NOT currently speaking
+      if (!isAISpeaking) {
+        console.log("➡️ AI not speaking - triggering response");
+        sendToOpenAI({
+          type: "response.create"
+        });
+      } else if (pendingInterruption) {
+        // If we have a pending interruption, wait for transcript to confirm it's real speech
+        console.log("⏳ Pending interruption - waiting for transcript");
+      } else {
+        // AI is speaking but no interruption was detected (still in grace period or no speech_started)
+        // This might be background noise - ignore it
+        console.log("⏭️ AI speaking, no interruption detected - ignoring");
+      }
     }
 
     // Track when response is created
@@ -213,16 +330,19 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "response.audio.started" || evt.type === "response.audio.delta") {
       if (!isAISpeaking) {
         isAISpeaking = true;
+        aiSpeakingStartTime = Date.now(); // Set grace period start time
         responseStartTimestamp = latestMediaTimestamp;
-        console.log("🎙️ AI started speaking");
+        console.log("🎙️ AI started speaking - grace period active");
       }
     }
 
     // Track when AI finishes speaking
     if (evt.type === "response.audio.done") {
       isAISpeaking = false;
+      aiSpeakingStartTime = null;
       responseStartTimestamp = null;
       lastAssistantItem = null;
+      pendingInterruption = false;
       console.log("✅ AI finished speaking (audio done)");
     }
     
@@ -235,8 +355,10 @@ wss.on("connection", (twilioSocket) => {
         if (isAISpeaking) {
           console.log("⚠️ Clearing isAISpeaking after response.done timeout");
           isAISpeaking = false;
+          aiSpeakingStartTime = null;
           responseStartTimestamp = null;
           lastAssistantItem = null;
+          pendingInterruption = false;
         }
       }, 500);
     }
@@ -268,10 +390,25 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcription for debugging
+    // Handle transcription for debugging and interruption detection
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       lastUserTranscript = evt.transcript || '';
       console.log(`👤 User said: "${lastUserTranscript}"`);
+      
+      // If there was a pending interruption, handle it
+      if (pendingInterruption) {
+        const wasPendingBefore = pendingInterruption;
+        handleInterruptionWithTranscript(lastUserTranscript);
+        
+        // If it was a real interruption (not filler), trigger response to user's question
+        // Check if pendingInterruption was cleared (meaning it was real speech, not filler)
+        if (wasPendingBefore && !pendingInterruption && !isAISpeaking) {
+          console.log("➡️ Triggering response to user's interruption");
+          sendToOpenAI({
+            type: "response.create"
+          });
+        }
+      }
     }
 
     if (evt.type === "response.text.done") {
