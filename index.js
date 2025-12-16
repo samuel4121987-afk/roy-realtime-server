@@ -58,6 +58,7 @@ const LOG_EVENT_TYPES = [
   'response.content.done',
   'rate_limits.updated',
   'response.done',
+  'response.created',
   'input_audio_buffer.committed',
   'input_audio_buffer.speech_stopped',
   'input_audio_buffer.speech_started',
@@ -65,7 +66,9 @@ const LOG_EVENT_TYPES = [
   'response.text.done',
   'conversation.item.input_audio_transcription.completed',
   'response.audio.delta',
-  'response.audio.done'
+  'response.audio.done',
+  'response.audio.started',
+  'conversation.item.created'
 ];
 
 // Expanded filler words list including Spanish
@@ -326,6 +329,11 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
+    // Track when response is created
+    if (evt.type === "response.created") {
+      console.log("🔄 Response created - waiting for audio");
+    }
+    
     // Track when AI starts speaking
     if (evt.type === "response.audio.started" || evt.type === "response.audio.delta") {
       if (!isAISpeaking) {
@@ -337,13 +345,30 @@ wss.on("connection", (twilioSocket) => {
     }
 
     // Track when AI finishes speaking
-    if (evt.type === "response.audio.done" || evt.type === "response.done") {
+    if (evt.type === "response.audio.done") {
       isAISpeaking = false;
       aiSpeakingStartTime = null;
       responseStartTimestamp = null;
       lastAssistantItem = null;
       pendingInterruption = false;
-      console.log("✅ AI finished speaking");
+      console.log("✅ AI finished speaking (audio done)");
+    }
+    
+    // Track response.done - clear speaking state after a delay to handle no-audio responses
+    if (evt.type === "response.done") {
+      console.log("✅ Response done");
+      // Set a timeout to clear isAISpeaking if it's still set after 500ms
+      // This handles cases where response has no audio or audio.done doesn't fire
+      setTimeout(() => {
+        if (isAISpeaking) {
+          console.log("⚠️ Clearing isAISpeaking after response.done timeout");
+          isAISpeaking = false;
+          aiSpeakingStartTime = null;
+          responseStartTimestamp = null;
+          lastAssistantItem = null;
+          pendingInterruption = false;
+        }
+      }, 500);
     }
 
     // Stream audio deltas back to Twilio with mark tracking
