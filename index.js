@@ -178,7 +178,12 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo", // Male voice
         temperature: 0.7, // Balanced for natural but consistent responses
         instructions: ROY_PROMPT,
-        turn_detection: null, // Disable automatic turn detection - we handle it manually
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
+        },
         max_response_output_tokens: 150, // Keep responses concise
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -297,36 +302,11 @@ wss.on("connection", (twilioSocket) => {
       handleSpeechStartedEvent();
     }
     
-    // Handle speech stopped - manually commit buffer
+    // Handle speech stopped - turn_detection handles this automatically now
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log("🤫 Speech stopped - committing audio buffer");
-      
-      // Always commit the audio buffer to get the transcript
-      sendToOpenAI({
-        type: "input_audio_buffer.commit"
-      });
-      
-      // Note: We'll trigger the response in the committed event handler
-    }
-    
-    // Handle buffer committed - trigger response after commit completes
-    if (evt.type === "input_audio_buffer.committed") {
-      console.log("✅ Audio buffer committed");
-      
-      // Only trigger response if AI is NOT currently speaking
-      if (!isAISpeaking) {
-        console.log("➡️ AI not speaking - triggering response");
-        sendToOpenAI({
-          type: "response.create"
-        });
-      } else if (pendingInterruption) {
-        // If we have a pending interruption, wait for transcript to confirm it's real speech
-        console.log("⏳ Pending interruption - waiting for transcript");
-      } else {
-        // AI is speaking but no interruption was detected (still in grace period or no speech_started)
-        // This might be background noise - ignore it
-        console.log("⏭️ AI speaking, no interruption detected - ignoring");
-      }
+      console.log("🤫 Speech stopped - turn_detection will handle response");
+      // With server_vad enabled, OpenAI automatically commits buffer and triggers response
+      // No manual intervention needed
     }
 
     // Track when response is created
@@ -405,17 +385,9 @@ wss.on("connection", (twilioSocket) => {
       
       // If there was a pending interruption, handle it
       if (pendingInterruption) {
-        const wasPendingBefore = pendingInterruption;
         handleInterruptionWithTranscript(lastUserTranscript);
-        
-        // If it was a real interruption (not filler), trigger response to user's question
-        // Check if pendingInterruption was cleared (meaning it was real speech, not filler)
-        if (wasPendingBefore && !pendingInterruption && !isAISpeaking) {
-          console.log("➡️ Triggering response to user's interruption");
-          sendToOpenAI({
-            type: "response.create"
-          });
-        }
+        // turn_detection will automatically trigger response when user stops speaking
+        // No need to manually trigger response
       }
     }
 
