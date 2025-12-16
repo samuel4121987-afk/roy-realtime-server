@@ -372,16 +372,18 @@ wss.on("connection", (twilioSocket) => {
       lastUserTranscript = evt.transcript || '';
       console.log(`👤 User said: "${lastUserTranscript}"`);
       
-      // Check if this was an interruption
-      const wasInterruption = pendingInterruption;
-      handleInterruptionWithTranscript(lastUserTranscript);
-      
-      // If it was a real interruption (not filler), trigger response to user's question
-      if (wasInterruption && !pendingInterruption && !isAISpeaking) {
-        console.log("➡️ Triggering response to user's interruption");
-        sendToOpenAI({
-          type: "response.create"
-        });
+      // If there was a pending interruption, handle it
+      if (pendingInterruption) {
+        const wasInterruption = true;
+        handleInterruptionWithTranscript(lastUserTranscript);
+        
+        // If it was a real interruption (not filler), trigger response to user's question
+        if (wasInterruption && !pendingInterruption && !isAISpeaking) {
+          console.log("➡️ Triggering response to user's interruption");
+          sendToOpenAI({
+            type: "response.create"
+          });
+        }
       }
     }
 
