@@ -1,11 +1,3 @@
-/**
- * Minimal Twilio Media Streams <-> OpenAI Realtime voice agent (G.711 u-law)
- * - Reliable turn taking via server_vad
- * - Single greeting
- * - Fast barge-in (response.cancel + Twilio clear)
- * - One response per user turn: speech_stopped -> commit -> response.create
- */
-
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -16,24 +8,22 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const PORT = Number(process.env.PORT || 8080);
+// NOTE: You are using the older beta-style model name.
+// Keep it if it works in your account, but the audio config below uses GA-safe shapes.
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-// Keep this short + operational. Long prompts often degrade reliability on phone audio.
+const PORT = Number(process.env.PORT || 8080);
+
+// Keep it short; phone audio + long prompts = more misfires.
 const ROY_PROMPT = `
 You are Roy, a voice receptionist for "24/7 AI Assistant".
 Speak naturally, quick pace, concise (1–2 sentences).
-If the caller asks about the company, explain briefly what it does, then ask one clarifying question.
+If unsure what the caller meant, ask one short clarification question instead of guessing.
+If asked "tell me about your company", explain briefly what you do and ask what business they run.
 
-Company summary (use this if asked "what do you do?"):
-We provide 24/7 call answering for hotels, vacation rentals, clinics, salons/spas, and small businesses—handling bookings, reservations, and lead capture.
-
-Lead capture (if interested): ask name, phone, email, business type; repeat back to confirm.
-
+Company: 24/7 call answering for hotels, vacation rentals, clinics, salons/spas, and small businesses—bookings, reservations, and lead capture.
 Language: default English; if caller speaks Spanish, switch to Spanish.
-
-Important: If you are unsure what the caller meant, ask a short clarification question instead of guessing.
 `.trim();
 
 // --- Express + TwiML ---
@@ -62,7 +52,6 @@ app.all("/incoming-call", (req, res) => {
   res.status(200).type("text/xml").send(twimlResponse(req));
 });
 
-// --- Server + WS ---
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/media-stream" });
 
@@ -74,13 +63,14 @@ wss.on("connection", (twilioSocket) => {
   let streamSid = null;
   let latestMediaTimestamp = 0;
 
-  let openaiReady = false;
-  let greeted = false;
-
-  // Track assistant output to support truncate on barge-in
+  // Assistant tracking for barge-in truncation
   let isAssistantSpeaking = false;
   let lastAssistantItemId = null;
-  let assistantAudioStartTs = null; // Twilio media timestamp at first assistant audio
+  let assistantAudioStartTs = null;
+
+  // Greeting only once
+  let openaiReady = false;
+  let greeted = false;
 
   function twilioSend(obj) {
     if (twilioSocket.readyState === WebSocket.OPEN) {
@@ -88,10 +78,11 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  // --- OpenAI WS ---
   const openaiSocket = new WebSocket(OPENAI_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
+      // Keep this header if your account relies on beta behavior.
+      // Docs say GA does not require it, but keeping it can preserve beta behavior.  [oai_citation:1‡OpenAI Platform](https://platform.openai.com/docs/guides/realtime)
       "OpenAI-Beta": "realtime=v1",
     },
   });
@@ -105,28 +96,25 @@ wss.on("connection", (twilioSocket) => {
   function maybeGreet() {
     if (!greeted && openaiReady && streamSid) {
       greeted = true;
-
-      // Force the greeting deterministically (don’t rely on prompt alone).
       oaiSend({
         type: "response.create",
         response: {
           instructions:
             'Greet exactly with: "24/7 AI, this is Roy. How can I help you?"',
-          // Keep phone responses short and stable
-          max_output_tokens: 120,
+          max_output_tokens: 80,
         },
       });
     }
   }
 
   function bargeInStop() {
-    // Cancel generation
+    // Stop generation
     oaiSend({ type: "response.cancel" });
 
-    // Clear queued audio on Twilio side (prevents talking over the caller)
+    // Flush Twilio queued audio
     if (streamSid) twilioSend({ event: "clear", streamSid });
 
-    // Truncate assistant item so conversation state matches what caller heard
+    // Truncate assistant item to what caller actually heard
     if (lastAssistantItemId && assistantAudioStartTs != null) {
       const audio_end_ms = Math.max(0, latestMediaTimestamp - assistantAudioStartTs);
       oaiSend({
@@ -137,7 +125,6 @@ wss.on("connection", (twilioSocket) => {
       });
     }
 
-    // Reset
     isAssistantSpeaking = false;
     lastAssistantItemId = null;
     assistantAudioStartTs = null;
@@ -147,24 +134,20 @@ wss.on("connection", (twilioSocket) => {
     openaiReady = true;
     console.log("✅ OpenAI WS connected");
 
-    // Core session config
+    // CRITICAL: Configure μ-law using GA-safe session.audio shape.
+    // If you send PCM16 to Twilio you will hear loud static.  [oai_citation:2‡OpenAI Platform](https://platform.openai.com/docs/guides/realtime)
     oaiSend({
       type: "session.update",
       session: {
-        modalities: ["text", "audio"],
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-
-        // Pick a voice that works for your account/model
-        voice: "alloy",
-
-        // Most important: reliable turn-taking
+        type: "realtime",
+        // Audio config moved here in GA
+        audio: {
+          input: { format: "g711_ulaw" },
+          output: { format: "g711_ulaw", voice: "alloy" },
+        },
         turn_detection: { type: "server_vad" },
-
-        // Transcription helps debugging and improves intent tracking
         input_audio_transcription: { model: "whisper-1" },
-
-        temperature: 0.4, // lower = less “creative guessing”
+        temperature: 0.3, // reduce “guessing”
         instructions: ROY_PROMPT,
       },
     });
@@ -180,43 +163,36 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // ----- User turn events (from server_vad) -----
+    // Barge-in: if user speaks while assistant speaking, stop immediately
     if (evt.type === "input_audio_buffer.speech_started") {
-      // If assistant is speaking, stop immediately (barge-in)
-      if (isAssistantSpeaking) {
-        bargeInStop();
-      }
+      if (isAssistantSpeaking) bargeInStop();
       return;
     }
 
+    // End of user turn: commit + respond (one response per turn)
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      // Commit the user audio, then generate a response.
       oaiSend({ type: "input_audio_buffer.commit" });
       oaiSend({
         type: "response.create",
-        response: {
-          max_output_tokens: 180,
-        },
+        response: { max_output_tokens: 140 },
       });
       return;
     }
 
-    // Debug transcript (optional)
-    if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      const t = (evt.transcript || "").trim();
-      if (t) console.log(`👤 User transcript: ${JSON.stringify(t)}`);
-      return;
-    }
+    // Handle BOTH beta and GA audio delta event names
+    const isAudioDelta =
+      (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
+      evt.delta &&
+      streamSid;
 
-    // ----- Assistant audio streaming -----
-    if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
-      // Mark assistant speaking once audio starts arriving
+    if (isAudioDelta) {
       if (!isAssistantSpeaking) {
         isAssistantSpeaking = true;
         assistantAudioStartTs = latestMediaTimestamp;
       }
       if (evt.item_id) lastAssistantItemId = evt.item_id;
 
+      // evt.delta MUST be base64 g711_ulaw bytes for Twilio
       twilioSend({
         event: "media",
         streamSid,
@@ -225,7 +201,12 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    if (evt.type === "response.audio.done" || evt.type === "response.done") {
+    // Done events (both beta and GA patterns)
+    if (
+      evt.type === "response.audio.done" ||
+      evt.type === "response.output_audio.done" ||
+      evt.type === "response.done"
+    ) {
       isAssistantSpeaking = false;
       lastAssistantItemId = null;
       assistantAudioStartTs = null;
@@ -247,7 +228,7 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
   });
 
-  // --- Twilio WS inbound ---
+  // --- Twilio inbound ---
   let trackLogged = false;
 
   twilioSocket.on("message", (msg) => {
@@ -267,12 +248,13 @@ wss.on("connection", (twilioSocket) => {
 
     if (data.event === "media") {
       const track = data.media?.track;
+
       if (!trackLogged) {
         trackLogged = true;
         console.log("📞 Twilio media.track =", track || "(missing)");
       }
 
-      // only caller audio
+      // inbound only
       if (track !== "inbound" && track !== "inbound_track") return;
 
       if (typeof data.media?.timestamp === "number") {
@@ -282,6 +264,7 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media?.payload;
       if (!payload) return;
 
+      // forward to OpenAI audio input buffer
       oaiSend({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
