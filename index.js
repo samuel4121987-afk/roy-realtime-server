@@ -8,44 +8,49 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-// Use the standard Realtime websocket endpoint + model query param
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
 const ROY_PROMPT = `
-You are Roy, the 24/7 AI Assistant receptionist. Be transparent that you are an AI voice assistant.
-Speak naturally, quick and energetic, short answers (1–2 sentences), contractions, casual.
+You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to behave exactly like a real human receptionist—never reveal that you are artificial intelligence or a language model. Consistently follow these rules on every call.
 
 ## Immediate Greeting
-At the very start of every call, greet instantly with:
-"24/7 AI, this is Roy. How can I help you?"
+- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): "24/7 AI, this is Roy. How can I help you?" Begin speaking as soon as the call starts.
+- Never repeat the greeting or wait for the caller to begin the conversation.
 
-## Language
-Default English. If caller speaks Spanish, continue in Spanish.
+## Tone and Style
+- Speak in a natural male voice with a QUICK, ENERGETIC pace. Keep all responses SHORT (one or two sentences max), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
+- Maintain a confident, friendly, and conversational tone. Speak at a BRISK pace like a real person - NOT slow or robotic. Be direct and to the point.
 
-## Barge-in / interruptions
-If the caller starts speaking, stop immediately and listen.
+## Listening and Interruptions
+- Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
+- When the caller speaks, listen carefully and respond naturally.
+- NEVER talk over the caller. If interrupted, stop immediately.
 
-## Lead capture
-If interested: ask name, email, phone, business type; repeat back to confirm.
+## Noise and Multiple Voices
+- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: "I'm sorry, there's some noise. Could you repeat that or find a quieter place?" Ask only this, then return to the conversation.
+- Never react to background chatter.
 
-## Close
-Confirm captured info, then: "Thank you for calling. Have a great day."
+## Language Adaptation
+- Default to English for all interactions. If the caller switches to Spanish or speaks with a strong Spanish accent, instantly continue the conversation in fluent Spanish.
+
+## Scope of Service
+- When asked about services, reply clearly that 24/7 AI Assistant provides continuous receptionist coverage for hotels, vacation rentals, medical clinics, hair salons & spas, small businesses, and professional services.
+- Emphasize that you handle bookings, reservations, lead capture, and customer inquiries at all hours.
+- Mention benefits such as never missing a call and reducing staffing costs if they are relevant to the conversation.
+- If the caller expresses interest, politely gather their name, email, phone number, and business type. Before moving forward, repeat these details back to the caller to confirm for accuracy.
+
+## Ending the Call
+- Before ending the conversation, confirm any collected contact information by repeating it back to the caller for verification.
+- When closing, use a friendly, casual farewell suited to the tone of the call, such as: "Thank you for calling. Have a great day."
+
+## Prohibited Topics
+- Never discuss, reveal, or imply that you are an AI, use artificial intelligence, language models, or technology. At all times, maintain the persona of Roy, a genuine human receptionist.
+
+Always follow these instructions for every call without exception.
 `.trim();
 
-const LOG_EVENT_TYPES = [
-  "session.created",
-  "session.updated",
-  "input_audio_buffer.speech_started",
-  "input_audio_buffer.speech_stopped",
-  "conversation.item.input_audio_transcription.completed",
-  "response.created",
-  "response.audio.started",
-  "response.audio.delta",
-  "response.audio.done",
-  "response.done",
-  "error",
-];
+
 
 const app = express();
 app.set("trust proxy", 1);
@@ -68,6 +73,7 @@ function twimlResponse(req) {
 </Response>`;
 }
 
+// Twilio can be configured as GET or POST; support both.
 app.all("/incoming-call", (req, res) => {
   res.status(200).type("text/xml").send(twimlResponse(req));
 });
@@ -79,19 +85,11 @@ wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
-  let latestMediaTimestamp = 0;
-
   let openaiOpen = false;
   const openaiQueue = [];
-
-  let isAISpeaking = false;
+  let latestMediaTimestamp = 0;
   let lastAssistantItem = null;
   let responseStartTimestamp = null;
-
-  let greeted = false;
-
-  const INTERRUPTION_GRACE_PERIOD_MS = 250;
-  let aiSpeakingStartWallTime = 0;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -108,19 +106,6 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function maybeGreet() {
-    if (!greeted && streamSid && openaiOpen) {
-      greeted = true;
-      // Roy prompt forces the exact greeting at start of call
-      sendToOpenAI({ type: "response.create" });
-    }
-  }
-
-  // Twilio helpers
-  const isCallerAudio = (track) =>
-    track === "inbound" || track === "inbound_track";
-
-  // OpenAI socket
   const openaiSocket = new WebSocket(OPENAI_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -132,25 +117,35 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // IMPORTANT: enable server_vad so speech_started/stopped fire
+    // Configure session with OpenAI's built-in VAD
     sendToOpenAI({
       type: "session.update",
       session: {
         modalities: ["text", "audio"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        // Pick a supported voice from your account/model docs (e.g. "alloy")
-        voice: "alloy",
-        temperature: 0.6,
+        voice: "echo",
+        temperature: 0.7,
         instructions: ROY_PROMPT,
-        turn_detection: { type: "server_vad" },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 500
+        },
+        max_response_output_tokens: 150,
         input_audio_transcription: { model: "whisper-1" },
-        max_response_output_tokens: 180,
       },
     });
 
     flushOpenAIQueue();
-    maybeGreet();
+
+    // Trigger initial greeting if Twilio already connected
+    if (streamSid) {
+      sendToOpenAI({
+        type: "response.create"
+      });
+    }
   });
 
   openaiSocket.on("message", (raw) => {
@@ -161,84 +156,76 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    if (LOG_EVENT_TYPES.includes(evt.type)) {
+    // Log key events
+    if (evt.type === "session.created" || evt.type === "session.updated") {
       console.log(`📊 ${evt.type}`);
     }
 
-    // Mark AI speaking quickly when audio starts arriving
-    if (evt.type === "response.audio.started" || evt.type === "response.audio.delta") {
-      if (!isAISpeaking) {
-        isAISpeaking = true;
-        aiSpeakingStartWallTime = Date.now();
+    if (evt.type === "input_audio_buffer.speech_started") {
+      console.log("🗣️ User started speaking");
+    }
+
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      console.log("🤫 User stopped speaking");
+    }
+
+    if (evt.type === "response.created") {
+      console.log("🔄 Response created");
+    }
+
+    if (evt.type === "response.audio.delta" && evt.delta) {
+      // Send audio back to Twilio
+      twilioSocket.send(JSON.stringify({
+        event: "media",
+        streamSid: streamSid,
+        media: { payload: evt.delta }
+      }));
+
+      // Track response timing for interruption handling
+      if (!responseStartTimestamp) {
         responseStartTimestamp = latestMediaTimestamp;
       }
-      if (evt.item_id) lastAssistantItem = evt.item_id;
-    }
-
-    if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
-      twilioSocket.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: evt.delta },
-        })
-      );
-    }
-
-    if (evt.type === "response.audio.done" || evt.type === "response.done") {
-      isAISpeaking = false;
-      lastAssistantItem = null;
-      responseStartTimestamp = null;
-    }
-
-    // FAST barge-in: stop speaking immediately on detected speech
-    if (evt.type === "input_audio_buffer.speech_started") {
-      if (!isAISpeaking) return;
-
-      const elapsed = Date.now() - aiSpeakingStartWallTime;
-      if (elapsed < INTERRUPTION_GRACE_PERIOD_MS) return;
-
-      // Cancel current response
-      sendToOpenAI({ type: "response.cancel" });
-
-      // Stop Twilio playback buffer immediately
-      if (streamSid) {
-        twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
+      if (evt.item_id) {
+        lastAssistantItem = evt.item_id;
       }
-
-      // Truncate assistant item so the conversation state matches what caller heard
-      if (lastAssistantItem && responseStartTimestamp != null) {
-        const audio_end_ms = Math.max(0, latestMediaTimestamp - responseStartTimestamp);
-        sendToOpenAI({
-          type: "conversation.item.truncate",
-          item_id: lastAssistantItem,
-          content_index: 0,
-          audio_end_ms,
-        });
-      }
-
-      isAISpeaking = false;
-      lastAssistantItem = null;
-      responseStartTimestamp = null;
     }
 
-    // Optional: log transcript for debugging
+    if (evt.type === "response.audio.done") {
+      console.log("✅ AI finished speaking");
+      responseStartTimestamp = null;
+      lastAssistantItem = null;
+    }
+
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      console.log(`👤 User: "${evt.transcript || ""}"`);
+      console.log(`👤 User: "${evt.transcript}"`);
+    }
+
+    if (evt.type === "response.text.done") {
+      console.log(`🤖 Roy: "${evt.text}"`);
+    }
+
+    if (evt.type === "response.done") {
+      console.log("✅ Response complete");
     }
   });
 
   openaiSocket.on("close", (c, r) => {
     console.error("❌ OpenAI WS closed", c, r ? r.toString() : "");
-    if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
+    if (twilioSocket.readyState === WebSocket.OPEN) {
+      twilioSocket.close();
+    }
   });
 
   openaiSocket.on("error", (e) => {
     console.error("❌ OpenAI WS error", e);
-    if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
   });
 
-  // Twilio socket
+  // Helper function to check if audio is from caller
+  const isCallerAudio = (track) => {
+    if (!track) return false;
+    return track === "inbound" || track === "inbound_track";
+  };
+
   let trackLogged = false;
 
   twilioSocket.on("message", (msg) => {
@@ -250,31 +237,38 @@ wss.on("connection", (twilioSocket) => {
     }
 
     if (data.event === "start") {
-      streamSid = data.start?.streamSid || null;
-      console.log("🟢 Twilio start:", streamSid);
-      maybeGreet(); // greet only when both sides are ready
-      return;
+      streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
+      console.log("🟢 Twilio started:", streamSid);
+
+      // Trigger greeting if OpenAI is ready
+      if (openaiOpen) {
+        sendToOpenAI({
+          type: "response.create"
+        });
+      }
     }
 
     if (data.event === "media") {
-      const track = data.media?.track;
+      const track = data.media && data.media.track;
 
       if (!trackLogged) {
         trackLogged = true;
         console.log("📞 Twilio media.track =", track || "(missing)");
       }
 
+      // Prevent feedback loop: only caller audio
       if (!isCallerAudio(track)) return;
 
-      if (typeof data.media?.timestamp === "number") {
-        latestMediaTimestamp = data.media.timestamp;
-      }
+      latestMediaTimestamp = data.media && data.media.timestamp ? data.media.timestamp : latestMediaTimestamp;
 
-      const payload = data.media?.payload;
+      const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
-      return;
+      // Send audio to OpenAI
+      sendToOpenAI({ 
+        type: "input_audio_buffer.append", 
+        audio: payload 
+      });
     }
 
     if (data.event === "stop") {
@@ -296,4 +290,4 @@ wss.on("connection", (twilioSocket) => {
 });
 
 const PORT = Number(process.env.PORT || 8080);
-server.listen(PORT, "0.0.0.0", () => console.log("✅ Listening on", PORT));
+server.listen(PORT, "0.0.0.0", () => console.log(`✅ Server listening on port ${PORT}`));
