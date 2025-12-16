@@ -193,21 +193,7 @@ wss.on("connection", (twilioSocket) => {
 
     // If Twilio start already arrived, greet immediately.
     if (streamSid) {
-      // First, add a user message to the conversation
-      sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Please greet the caller now."
-            }
-          ]
-        }
-      });
-      // Then trigger a response
+      // Trigger greeting response immediately
       sendToOpenAI({
         type: "response.create"
       });
@@ -435,19 +421,7 @@ wss.on("connection", (twilioSocket) => {
 
       // Greet immediately as soon as both sides are ready (queued if OpenAI not open yet)
       if (streamSid) {
-        sendToOpenAI({
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: "Please greet the caller now."
-              }
-            ]
-          }
-        });
+        // Just trigger response - Roy's prompt tells him to greet immediately
         sendToOpenAI({
           type: "response.create"
         });
