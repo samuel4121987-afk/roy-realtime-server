@@ -294,7 +294,7 @@ wss.on("connection", (twilioSocket) => {
       handleSpeechStartedEvent();
     }
     
-    // Handle speech stopped - manually commit and trigger response
+    // Handle speech stopped - manually commit buffer
     if (evt.type === "input_audio_buffer.speech_stopped") {
       console.log("🤫 Speech stopped - committing audio buffer");
       
@@ -303,6 +303,13 @@ wss.on("connection", (twilioSocket) => {
         type: "input_audio_buffer.commit"
       });
       
+      // Note: We'll trigger the response in the committed event handler
+    }
+    
+    // Handle buffer committed - trigger response after commit completes
+    if (evt.type === "input_audio_buffer.committed") {
+      console.log("✅ Audio buffer committed");
+      
       // Only trigger response if AI is NOT currently speaking
       if (!isAISpeaking) {
         console.log("➡️ AI not speaking - triggering response");
@@ -310,8 +317,7 @@ wss.on("connection", (twilioSocket) => {
           type: "response.create"
         });
       } else if (pendingInterruption) {
-        // If we have a pending interruption, we already committed above
-        // Wait for transcript to confirm it's real speech before responding
+        // If we have a pending interruption, wait for transcript to confirm it's real speech
         console.log("⏳ Pending interruption - waiting for transcript");
       } else {
         // AI is speaking but no interruption was detected (still in grace period or no speech_started)
@@ -374,11 +380,12 @@ wss.on("connection", (twilioSocket) => {
       
       // If there was a pending interruption, handle it
       if (pendingInterruption) {
-        const wasInterruption = true;
+        const wasPendingBefore = pendingInterruption;
         handleInterruptionWithTranscript(lastUserTranscript);
         
         // If it was a real interruption (not filler), trigger response to user's question
-        if (wasInterruption && !pendingInterruption && !isAISpeaking) {
+        // Check if pendingInterruption was cleared (meaning it was real speech, not filler)
+        if (wasPendingBefore && !pendingInterruption && !isAISpeaking) {
           console.log("➡️ Triggering response to user's interruption");
           sendToOpenAI({
             type: "response.create"
