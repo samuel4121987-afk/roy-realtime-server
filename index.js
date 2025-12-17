@@ -8,281 +8,182 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-// NOTE: You are using the older beta-style model name.
-// Keep it if it works in your account, but the audio config below uses GA-safe shapes.
+const PORT = Number(process.env.PORT || 8080);
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-const PORT = Number(process.env.PORT || 8080);
+/* ------------------------------------------------------------------ */
+/* μ-LAW ENCODER (PCM16 -> G711 μ-law)                                  */
+/* ------------------------------------------------------------------ */
+function pcm16ToMulaw(pcm16) {
+  const MULAW_MAX = 0x1FFF;
+  const BIAS = 33;
+  const out = Buffer.alloc(pcm16.length / 2);
 
-// Keep it short; phone audio + long prompts = more misfires.
-const ROY_PROMPT = `
-You are Roy, a voice receptionist for "24/7 AI Assistant".
-Speak naturally, quick pace, concise (1–2 sentences).
-If unsure what the caller meant, ask one short clarification question instead of guessing.
-If asked "tell me about your company", explain briefly what you do and ask what business they run.
+  for (let i = 0, j = 0; i < pcm16.length; i += 2, j++) {
+    let sample = pcm16.readInt16LE(i);
+    let sign = sample < 0 ? 0x80 : 0;
+    if (sign) sample = -sample;
+    if (sample > MULAW_MAX) sample = MULAW_MAX;
+    sample += BIAS;
 
-Company: 24/7 call answering for hotels, vacation rentals, clinics, salons/spas, and small businesses—bookings, reservations, and lead capture.
-Language: default English; if caller speaks Spanish, switch to Spanish.
-`.trim();
+    let exponent = 7;
+    for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
 
-// --- Express + TwiML ---
+    let mantissa = (sample >> (exponent + 3)) & 0x0F;
+    out[j] = ~(sign | (exponent << 4) | mantissa);
+  }
+
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* APP + TWIML                                                        */
+/* ------------------------------------------------------------------ */
 const app = express();
-app.set("trust proxy", 1);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.get("/", (_, res) => res.send("OK"));
 
-app.get("/", (_req, res) => res.status(200).send("OK"));
-
-function twimlResponse(req) {
+app.all("/incoming-call", (req, res) => {
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const wsProto = proto === "http" ? "ws" : "wss";
-  const wsUrl = `${wsProto}://${host}/media-stream`;
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  res.type("text/xml").send(`
 <Response>
   <Connect>
-    <Stream url="${wsUrl}" track="inbound_track"/>
+    <Stream url="${wsProto}://${host}/media-stream" track="inbound_track"/>
   </Connect>
-</Response>`;
-}
-
-app.all("/incoming-call", (req, res) => {
-  res.status(200).type("text/xml").send(twimlResponse(req));
+</Response>
+`);
 });
 
+/* ------------------------------------------------------------------ */
+/* SERVER + SOCKETS                                                   */
+/* ------------------------------------------------------------------ */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/media-stream" });
 
-server.listen(PORT, "0.0.0.0", () => console.log("✅ Listening on", PORT));
+server.listen(PORT, () => console.log("✅ Listening on", PORT));
 
 wss.on("connection", (twilioSocket) => {
-  console.log("✅ Twilio WS connected");
+  console.log("✅ Twilio connected");
 
   let streamSid = null;
-  let latestMediaTimestamp = 0;
-
-  // Assistant tracking for barge-in truncation
-  let isAssistantSpeaking = false;
-  let lastAssistantItemId = null;
-  let assistantAudioStartTs = null;
-
-  // Greeting only once
-  let openaiReady = false;
+  let latestTs = 0;
+  let speaking = false;
   let greeted = false;
-
-  function twilioSend(obj) {
-    if (twilioSocket.readyState === WebSocket.OPEN) {
-      twilioSocket.send(JSON.stringify(obj));
-    }
-  }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      // Keep this header if your account relies on beta behavior.
-      // Docs say GA does not require it, but keeping it can preserve beta behavior.  [oai_citation:1‡OpenAI Platform](https://platform.openai.com/docs/guides/realtime)
       "OpenAI-Beta": "realtime=v1",
     },
   });
 
-  function oaiSend(obj) {
+  const sendToTwilio = (obj) => {
+    if (twilioSocket.readyState === WebSocket.OPEN) {
+      twilioSocket.send(JSON.stringify(obj));
+    }
+  };
+
+  const sendToOpenAI = (obj) => {
     if (openaiSocket.readyState === WebSocket.OPEN) {
       openaiSocket.send(JSON.stringify(obj));
     }
-  }
-
-  function maybeGreet() {
-    if (!greeted && openaiReady && streamSid) {
-      greeted = true;
-      oaiSend({
-        type: "response.create",
-        response: {
-          instructions:
-            'Greet exactly with: "24/7 AI, this is Roy. How can I help you?"',
-          max_output_tokens: 80,
-        },
-      });
-    }
-  }
-
-  function bargeInStop() {
-    // Stop generation
-    oaiSend({ type: "response.cancel" });
-
-    // Flush Twilio queued audio
-    if (streamSid) twilioSend({ event: "clear", streamSid });
-
-    // Truncate assistant item to what caller actually heard
-    if (lastAssistantItemId && assistantAudioStartTs != null) {
-      const audio_end_ms = Math.max(0, latestMediaTimestamp - assistantAudioStartTs);
-      oaiSend({
-        type: "conversation.item.truncate",
-        item_id: lastAssistantItemId,
-        content_index: 0,
-        audio_end_ms,
-      });
-    }
-
-    isAssistantSpeaking = false;
-    lastAssistantItemId = null;
-    assistantAudioStartTs = null;
-  }
+  };
 
   openaiSocket.on("open", () => {
-    openaiReady = true;
-    console.log("✅ OpenAI WS connected");
+    console.log("✅ OpenAI connected");
 
-    // CRITICAL: Configure μ-law using GA-safe session.audio shape.
-    // If you send PCM16 to Twilio you will hear loud static.  [oai_citation:2‡OpenAI Platform](https://platform.openai.com/docs/guides/realtime)
-    oaiSend({
+    sendToOpenAI({
       type: "session.update",
       session: {
-        type: "realtime",
-        // Audio config moved here in GA
-        audio: {
-          input: { format: "g711_ulaw" },
-          output: { format: "g711_ulaw", voice: "alloy" },
-        },
+        modalities: ["text", "audio"],
         turn_detection: { type: "server_vad" },
         input_audio_transcription: { model: "whisper-1" },
-        temperature: 0.3, // reduce “guessing”
-        instructions: ROY_PROMPT,
+        temperature: 0.4,
+        instructions: `
+You are Roy, a professional voice receptionist for "24/7 AI Assistant".
+Speak clearly, naturally, 1–2 sentences.
+If unsure what the caller means, ask ONE clarification question.
+If asked about the company, explain briefly then ask their business type.
+Switch to Spanish if caller speaks Spanish.
+`.trim(),
       },
     });
-
-    maybeGreet();
   });
 
   openaiSocket.on("message", (raw) => {
     let evt;
-    try {
-      evt = JSON.parse(raw.toString());
-    } catch {
+    try { evt = JSON.parse(raw); } catch { return; }
+
+    if (evt.type === "input_audio_buffer.speech_started" && speaking) {
+      sendToOpenAI({ type: "response.cancel" });
+      sendToTwilio({ event: "clear", streamSid });
+      speaking = false;
       return;
     }
 
-    // Barge-in: if user speaks while assistant speaking, stop immediately
-    if (evt.type === "input_audio_buffer.speech_started") {
-      if (isAssistantSpeaking) bargeInStop();
-      return;
-    }
-
-    // End of user turn: commit + respond (one response per turn)
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      oaiSend({ type: "input_audio_buffer.commit" });
-      oaiSend({
-        type: "response.create",
-        response: { max_output_tokens: 140 },
-      });
+      sendToOpenAI({ type: "input_audio_buffer.commit" });
+      sendToOpenAI({ type: "response.create" });
       return;
     }
 
-    // Handle BOTH beta and GA audio delta event names
-    const isAudioDelta =
-      (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
+    if (
+      (evt.type === "response.audio.delta" ||
+       evt.type === "response.output_audio.delta") &&
       evt.delta &&
-      streamSid;
+      streamSid
+    ) {
+      speaking = true;
 
-    if (isAudioDelta) {
-      if (!isAssistantSpeaking) {
-        isAssistantSpeaking = true;
-        assistantAudioStartTs = latestMediaTimestamp;
-      }
-      if (evt.item_id) lastAssistantItemId = evt.item_id;
+      const pcm = Buffer.from(evt.delta, "base64");
+      const mulaw = pcm16ToMulaw(pcm);
 
-      // evt.delta MUST be base64 g711_ulaw bytes for Twilio
-      twilioSend({
+      sendToTwilio({
         event: "media",
         streamSid,
-        media: { payload: evt.delta },
+        media: { payload: mulaw.toString("base64") },
       });
       return;
     }
 
-    // Done events (both beta and GA patterns)
-    if (
-      evt.type === "response.audio.done" ||
-      evt.type === "response.output_audio.done" ||
-      evt.type === "response.done"
-    ) {
-      isAssistantSpeaking = false;
-      lastAssistantItemId = null;
-      assistantAudioStartTs = null;
-      return;
-    }
-
-    if (evt.type === "error") {
-      console.log("❌ OpenAI error:", evt);
+    if (evt.type === "response.done") {
+      speaking = false;
     }
   });
-
-  openaiSocket.on("close", (code, reason) => {
-    console.log("❌ OpenAI WS closed", code, reason?.toString?.() || "");
-    if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
-  });
-
-  openaiSocket.on("error", (e) => {
-    console.log("❌ OpenAI WS error", e);
-    if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
-  });
-
-  // --- Twilio inbound ---
-  let trackLogged = false;
 
   twilioSocket.on("message", (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(msg); } catch { return; }
 
     if (data.event === "start") {
-      streamSid = data.start?.streamSid || null;
-      console.log("🟢 Twilio start:", streamSid);
-      maybeGreet();
+      streamSid = data.start.streamSid;
+      if (!greeted) {
+        greeted = true;
+        sendToOpenAI({
+          type: "response.create",
+          response: {
+            instructions: 'Say exactly: "24/7 AI, this is Roy. How can I help you?"',
+          },
+        });
+      }
       return;
     }
 
     if (data.event === "media") {
-      const track = data.media?.track;
-
-      if (!trackLogged) {
-        trackLogged = true;
-        console.log("📞 Twilio media.track =", track || "(missing)");
-      }
-
-      // inbound only
-      if (track !== "inbound" && track !== "inbound_track") return;
-
-      if (typeof data.media?.timestamp === "number") {
-        latestMediaTimestamp = data.media.timestamp;
-      }
-
-      const payload = data.media?.payload;
-      if (!payload) return;
-
-      // forward to OpenAI audio input buffer
-      oaiSend({ type: "input_audio_buffer.append", audio: payload });
-      return;
-    }
-
-    if (data.event === "stop") {
-      console.log("🔴 Twilio stop");
-      if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
-      if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
+      if (data.media.track !== "inbound_track") return;
+      latestTs = data.media.timestamp;
+      sendToOpenAI({
+        type: "input_audio_buffer.append",
+        audio: data.media.payload,
+      });
     }
   });
 
-  twilioSocket.on("close", () => {
-    console.log("🔴 Twilio WS closed");
-    if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
-  });
-
-  twilioSocket.on("error", (e) => {
-    console.log("❌ Twilio WS error", e);
-    if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
-  });
+  twilioSocket.on("close", () => openaiSocket.close());
+  openaiSocket.on("close", () => twilioSocket.close());
 });
