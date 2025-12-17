@@ -22,13 +22,10 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 - Speak in a natural male voice with a QUICK, ENERGETIC pace. Keep all responses SHORT (one or two sentences max), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
 - Maintain a confident, friendly, and conversational tone. Speak at a BRISK pace like a real person - NOT slow or robotic. Be direct and to the point.
 
-## Listening and Interruptions - CRITICAL
+## Listening and Interruptions
 - Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
-- The MOMENT you detect the caller starting to speak (not just filler words), you MUST STOP talking IMMEDIATELY. Do not finish your sentence. Do not continue speaking.
-- After you stop, listen carefully to determine if it's a real question or just a brief acknowledgment.
-- If it's a real question or statement, answer it directly and concisely.
-- If it was just a brief filler word like "yes," "uh-huh," "okay," "aha," "si," "vale," you may briefly continue your previous point.
-- NEVER talk over the caller. Stopping immediately when they speak is more important than finishing your thought.
+- When the caller speaks, stop immediately and listen.
+- NEVER talk over the caller.
 
 ## Noise and Multiple Voices
 - Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: "I'm sorry, there's some noise. Could you repeat that or find a quieter place?" Ask only this, then return to the conversation.
@@ -53,29 +50,13 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 Always follow these instructions for every call without exception.
 `.trim();
 
-// Event types to log for debugging
-const LOG_EVENT_TYPES = [
-  'response.content.done',
-  'rate_limits.updated',
-  'response.done',
-  'response.created',
-  'input_audio_buffer.committed',
-  'input_audio_buffer.speech_stopped',
-  'input_audio_buffer.speech_started',
-  'session.created',
-  'response.text.done',
-  'conversation.item.input_audio_transcription.completed',
-  'response.audio.delta',
-  'response.audio.done',
-  'response.audio.started',
-  'conversation.item.created'
-];
-
 // Expanded filler words list including Spanish
 const FILLER_WORDS = [
   'uh', 'um', 'hmm', 'ah', 'er', 'like', 'you know',
   'aha', 'yes', 'yeah', 'yep', 'okay', 'ok', 'sure', 'right',
-  'si', 'vale', 'bueno', 'claro', 'uh-huh', 'mm-hmm', 'mhm'
+  'si', 'vale', 'bueno', 'claro', 'uh-huh', 'mm-hmm', 'mhm',
+  'yup', 'mm', 'no', 'wait', 'hold on', 'what', 'huh',
+  'qué', 'espera', 'a ver', 'vale sí', 'ya', 'okay yeah'
 ];
 
 // Function to check if text is just filler words
@@ -130,16 +111,8 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
   let latestMediaTimestamp = 0;
-  let lastAssistantItem = null;
-  let responseStartTimestamp = null;
-  const markQueue = [];
-  let reconnectAttempts = 0;
-  const MAX_RECONNECT_ATTEMPTS = 3;
-  let lastUserTranscript = '';
   let isAISpeaking = false;
-  let pendingInterruption = false;
-  let aiSpeakingStartTime = null;
-  const INTERRUPTION_GRACE_PERIOD = 3000; // 3 seconds grace period at start
+  let lastUserTranscript = '';
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -166,122 +139,40 @@ wss.on("connection", (twilioSocket) => {
   openaiSocket.on("open", () => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
-    reconnectAttempts = 0;
 
-    // Configure session (modalities MUST include text + audio)
+    // Configure session
     sendToOpenAI({
       type: "session.update",
       session: {
         modalities: ["text", "audio"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        voice: "echo", // Male voice
-        temperature: 0.7, // Balanced for natural but consistent responses
+        voice: "echo",
+        temperature: 0.7,
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.6,
+          threshold: 0.5,
           prefix_padding_ms: 300,
-          silence_duration_ms: 1200
+          silence_duration_ms: 700
         },
-        max_response_output_tokens: 150, // Keep responses concise
+        max_response_output_tokens: 150,
         input_audio_transcription: { model: "whisper-1" },
       },
     });
 
     flushOpenAIQueue();
 
-    // If Twilio start already arrived, greet immediately.
+    // Trigger initial greeting if Twilio already connected (no fake user message)
     if (streamSid) {
-      // First, add a user message to the conversation
       sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: "Please greet the caller now."
-            }
-          ]
+        type: "response.create",
+        response: {
+          instructions: "This is the start of the call. Greet immediately with exactly: '24/7 AI, this is Roy. How can I help you?'"
         }
-      });
-      // Then trigger a response
-      sendToOpenAI({
-        type: "response.create"
       });
     }
   });
-
-  // Handle interruptions - WAIT FOR TRANSCRIPT BEFORE DECIDING
-  function handleSpeechStartedEvent() {
-    if (isAISpeaking) {
-      const now = Date.now();
-      const timeSinceAIStarted = now - aiSpeakingStartTime;
-      
-      // Check if we're still in initial grace period
-      if (timeSinceAIStarted < INTERRUPTION_GRACE_PERIOD) {
-        console.log(`⏳ Speech detected but in grace period (${timeSinceAIStarted}ms) - ignoring`);
-        return;
-      }
-      
-      // Mark that we detected speech and are waiting for transcript
-      console.log("🗣️ Speech detected while AI speaking - waiting for transcript to decide");
-      pendingInterruption = true;
-      
-      // DO NOT cancel response yet - wait for transcript to determine if it's real speech
-    } else {
-      // AI is not speaking, so this is normal user speech - no special handling needed
-      console.log("👂 User started speaking (AI not speaking)");
-    }
-  }
-
-  function handleInterruptionWithTranscript(transcript) {
-    if (!pendingInterruption) {
-      return;
-    }
-
-    // Check if it's just filler words
-    if (isOnlyFillerWords(transcript)) {
-      console.log(`💬 Filler detected: "${transcript}" - letting Roy continue`);
-      pendingInterruption = false;
-      // Don't interrupt - Roy keeps talking
-      return;
-    }
-
-    // Real interruption confirmed - NOW we stop Roy
-    console.log(`🛑 Real interruption confirmed: "${transcript}" - STOPPING Roy NOW`);
-    
-    // Cancel the current response
-    sendToOpenAI({
-      type: "response.cancel"
-    });
-    
-    // Clear all audio from Twilio queue
-    twilioSocket.send(JSON.stringify({
-      event: "clear",
-      streamSid: streamSid
-    }));
-    markQueue.length = 0;
-    
-    // Truncate the conversation item if we have it
-    if (lastAssistantItem && responseStartTimestamp) {
-      const elapsedTime = latestMediaTimestamp - responseStartTimestamp;
-      sendToOpenAI({
-        type: "conversation.item.truncate",
-        item_id: lastAssistantItem,
-        content_index: 0,
-        audio_end_ms: elapsedTime
-      });
-    }
-    
-    // Clear state
-    lastAssistantItem = null;
-    responseStartTimestamp = null;
-    isAISpeaking = false;
-    pendingInterruption = false;
-  }
 
   openaiSocket.on("message", (raw) => {
     let evt;
@@ -291,108 +182,86 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Log important events for debugging
-    if (LOG_EVENT_TYPES.includes(evt.type)) {
-      console.log(`📊 Event: ${evt.type}`);
-    }
-
-    // Handle speech started (interruption detection)
+    // Handle speech started - STOP IMMEDIATELY (audio-level, no grace period)
     if (evt.type === "input_audio_buffer.speech_started") {
-      console.log("🗣️ Speech detected!");
-      handleSpeechStartedEvent();
+      if (isAISpeaking) {
+        console.log("🛑 User speaking - stopping Roy IMMEDIATELY");
+        
+        // Stop immediately - no grace period, no transcript wait
+        sendToOpenAI({ type: "response.cancel" });
+        
+        // Clear Twilio audio queue
+        twilioSocket.send(JSON.stringify({
+          event: "clear",
+          streamSid: streamSid
+        }));
+        
+        // Reset state
+        isAISpeaking = false;
+      } else {
+        console.log("👂 User started speaking");
+      }
     }
     
-    // Handle speech stopped - turn_detection handles this automatically now
+    // Handle speech stopped - commit buffer (required!)
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      console.log("🤫 Speech stopped - turn_detection will handle response");
-      // With server_vad enabled, OpenAI automatically commits buffer and triggers response
-      // No manual intervention needed
+      console.log("🤫 User stopped speaking - committing audio buffer");
+      sendToOpenAI({ type: "input_audio_buffer.commit" });
+      // Do NOT create response here - wait for transcript
     }
 
-    // Track when response is created
-    if (evt.type === "response.created") {
-      console.log("🔄 Response created - waiting for audio");
-    }
-    
     // Track when AI starts speaking
-    if (evt.type === "response.audio.started" || evt.type === "response.audio.delta") {
-      if (!isAISpeaking) {
-        isAISpeaking = true;
-        aiSpeakingStartTime = Date.now(); // Set grace period start time
-        responseStartTimestamp = latestMediaTimestamp;
-        console.log("🎙️ AI started speaking - grace period active");
-      }
+    if (evt.type === "response.audio.started") {
+      isAISpeaking = true;
+      console.log("🎙️ Roy started speaking");
     }
 
     // Track when AI finishes speaking
     if (evt.type === "response.audio.done") {
       isAISpeaking = false;
-      aiSpeakingStartTime = null;
-      responseStartTimestamp = null;
-      lastAssistantItem = null;
-      pendingInterruption = false;
-      console.log("✅ AI finished speaking (audio done)");
-    }
-    
-    // Track response.done - clear speaking state after a delay to handle no-audio responses
-    if (evt.type === "response.done") {
-      console.log("✅ Response done");
-      // Set a timeout to clear isAISpeaking if it's still set after 500ms
-      // This handles cases where response has no audio or audio.done doesn't fire
-      setTimeout(() => {
-        if (isAISpeaking) {
-          console.log("⚠️ Clearing isAISpeaking after response.done timeout");
-          isAISpeaking = false;
-          aiSpeakingStartTime = null;
-          responseStartTimestamp = null;
-          lastAssistantItem = null;
-          pendingInterruption = false;
-        }
-      }, 500);
+      console.log("✅ Roy finished speaking");
     }
 
-    // Stream audio deltas back to Twilio with mark tracking
+    // Stream audio deltas back to Twilio (no marks)
     if (evt.type === "response.audio.delta" && evt.delta) {
-      const audioDelta = {
+      twilioSocket.send(JSON.stringify({
         event: "media",
         streamSid: streamSid,
         media: { payload: evt.delta }
-      };
-      twilioSocket.send(JSON.stringify(audioDelta));
-
-      // IMPROVED: Track each audio chunk with a mark
-      const markId = `mark_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      markQueue.push(markId);
-      twilioSocket.send(JSON.stringify({
-        event: "mark",
-        streamSid: streamSid,
-        mark: { name: markId }
       }));
-
-      // Track response timing
-      if (!responseStartTimestamp) {
-        responseStartTimestamp = latestMediaTimestamp;
-      }
-      if (evt.item_id) {
-        lastAssistantItem = evt.item_id;
-      }
     }
 
-    // Handle transcription for debugging and interruption detection
+    // Handle transcription - NOW decide what to say (semantic-level decision)
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      lastUserTranscript = evt.transcript || '';
+      lastUserTranscript = (evt.transcript || "").trim();
       console.log(`👤 User said: "${lastUserTranscript}"`);
       
-      // If there was a pending interruption, handle it
-      if (pendingInterruption) {
-        handleInterruptionWithTranscript(lastUserTranscript);
-        // turn_detection will automatically trigger response when user stops speaking
-        // No need to manually trigger response
+      // Always create response after transcript (this is the turn decision)
+      const isFiller = isOnlyFillerWords(lastUserTranscript);
+      
+      if (isFiller) {
+        console.log("💬 Filler detected - brief acknowledgment");
+        sendToOpenAI({
+          type: "response.create",
+          response: {
+            instructions: "Caller utterance was a brief acknowledgment like 'yeah' or 'okay'. Reply very briefly (just 'Got it' or 'Okay') and continue the prior topic with ONE new sentence."
+          }
+        });
+      } else {
+        console.log("❓ Real message - answering");
+        sendToOpenAI({
+          type: "response.create",
+          response: {
+            instructions: "Caller utterance is a real message or question. Answer directly and briefly (1–2 sentences). If unclear, ask one short clarification question."
+          }
+        });
       }
+      
+
     }
 
     if (evt.type === "response.text.done") {
-      console.log(`🤖 AI response: "${evt.text}"`);
+      console.log(`🤖 Roy: "${evt.text}"`);
     }
   });
 
@@ -405,12 +274,6 @@ wss.on("connection", (twilioSocket) => {
 
   openaiSocket.on("error", (e) => {
     console.error("❌ OpenAI WS error", e);
-    
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      console.log(`🔄 Attempting reconnect ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
-      // Note: In production, you'd implement actual reconnection logic here
-    }
   });
 
   // Helper function to check if audio is from caller
@@ -433,23 +296,13 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("🟢 Twilio start:", streamSid);
 
-      // Greet immediately as soon as both sides are ready (queued if OpenAI not open yet)
-      if (streamSid) {
+      // Trigger greeting if OpenAI is ready (no fake user message)
+      if (openaiOpen) {
         sendToOpenAI({
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: "Please greet the caller now."
-              }
-            ]
+          type: "response.create",
+          response: {
+            instructions: "This is the start of the call. Greet immediately with exactly: '24/7 AI, this is Roy. How can I help you?'"
           }
-        });
-        sendToOpenAI({
-          type: "response.create"
         });
       }
     }
@@ -471,13 +324,6 @@ wss.on("connection", (twilioSocket) => {
       if (!payload) return;
 
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
-    }
-
-    if (data.event === "mark") {
-      // Remove the mark from queue when Twilio confirms receipt
-      if (markQueue.length > 0) {
-        markQueue.shift();
-      }
     }
 
     if (data.event === "stop") {
