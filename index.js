@@ -113,6 +113,13 @@ wss.on("connection", (twilioSocket) => {
   let latestMediaTimestamp = 0;
   let isAISpeaking = false;
   let lastUserTranscript = '';
+  
+  // Debounced barge-in to avoid false triggers from noise
+  let bargeTimer = null;
+  let pendingBargeIn = false;
+  const BARGE_IN_DEBOUNCE_MS = 160;
+  let cancelCooldownUntil = 0;
+  const CANCEL_COOLDOWN_MS = 250;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -152,7 +159,7 @@ wss.on("connection", (twilioSocket) => {
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.5,
+          threshold: 0.6,
           prefix_padding_ms: 300,
           silence_duration_ms: 700
         },
@@ -182,29 +189,37 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Handle speech started - STOP IMMEDIATELY (audio-level, no grace period)
+    // Handle speech started - DEBOUNCED barge-in (avoid false triggers from noise)
     if (evt.type === "input_audio_buffer.speech_started") {
-      if (isAISpeaking) {
-        console.log("🛑 User speaking - stopping Roy IMMEDIATELY");
-        
-        // Stop immediately - no grace period, no transcript wait
-        sendToOpenAI({ type: "response.cancel" });
-        
-        // Clear Twilio audio queue
-        twilioSocket.send(JSON.stringify({
-          event: "clear",
-          streamSid: streamSid
-        }));
-        
-        // Reset state
-        isAISpeaking = false;
-      } else {
+      if (!isAISpeaking) {
         console.log("👂 User started speaking");
+        return;
       }
+      
+      const now = Date.now();
+      if (now < cancelCooldownUntil) return;
+      
+      pendingBargeIn = true;
+      
+      if (bargeTimer) clearTimeout(bargeTimer);
+      bargeTimer = setTimeout(() => {
+        if (!pendingBargeIn) return;
+        
+        console.log("🛑 User speaking (debounced) - stopping Roy");
+        sendToOpenAI({ type: "response.cancel" });
+        twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
+        
+        isAISpeaking = false;
+        pendingBargeIn = false;
+        cancelCooldownUntil = Date.now() + CANCEL_COOLDOWN_MS;
+      }, BARGE_IN_DEBOUNCE_MS);
     }
     
-    // Handle speech stopped - commit buffer (required!)
+    // Handle speech stopped - clear pending barge-in and commit buffer
     if (evt.type === "input_audio_buffer.speech_stopped") {
+      pendingBargeIn = false;
+      if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = null; }
+      
       console.log("🤫 User stopped speaking - committing audio buffer");
       sendToOpenAI({ type: "input_audio_buffer.commit" });
       // Do NOT create response here - wait for transcript
@@ -224,6 +239,9 @@ wss.on("connection", (twilioSocket) => {
 
     // Stream audio deltas back to Twilio (no marks)
     if (evt.type === "response.audio.delta" && evt.delta) {
+      // Set isAISpeaking on first audio delta for consistency
+      if (!isAISpeaking) isAISpeaking = true;
+      
       twilioSocket.send(JSON.stringify({
         event: "media",
         streamSid: streamSid,
