@@ -173,10 +173,12 @@ wss.on("connection", (twilioSocket) => {
   let responseInFlight = false;
   let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
 
-  // ✅ MODIFIED: Reduced to 1 packet for INSTANT interruption
+  // ✅ INSTANT CANCEL: Cancel immediately on speech_started (after grace period)
   let bargePacketCount = 0;
   let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 1; // CHANGED from 4 to 1 - Roy shuts up INSTANTLY
+  const PRE_CANCEL_PACKETS = 1;
+  let aiSpeechStartedAt = 0;
+  const BARGE_IN_GRACE_MS = 280; // tune 220–350 to avoid echo cancels
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -240,7 +242,7 @@ wss.on("connection", (twilioSocket) => {
           type: "server_vad",
           threshold: 0.78,
           prefix_padding_ms: 300,
-          silence_duration_ms: 800
+          silence_duration_ms: 450
         },
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -278,15 +280,24 @@ wss.on("connection", (twilioSocket) => {
     // Speaking flags
     if (evt.type === "response.created") responseInFlight = true;
     if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
-    if (evt.type === "response.audio.started") isAISpeaking = true;
+    if (evt.type === "response.audio.started") {
+      isAISpeaking = true;
+      aiSpeechStartedAt = Date.now(); // Stamp time when Roy starts speaking
+    }
     if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    // Only mark pending barge-in if caller speech starts WHILE Roy is speaking
+    // ✅ INSTANT CANCEL: Stop Roy immediately when caller starts speaking (after grace period)
     if (evt.type === "input_audio_buffer.speech_started") {
       if (isAISpeaking || responseInFlight) {
         pendingBargeIn = true;
         bargePacketCount = 0;
-        preCancelFired = false;
+
+        // Cancel immediately once caller starts speaking, but ignore first ~280ms after Roy begins (echo window)
+        if (!preCancelFired && (Date.now() - aiSpeechStartedAt) > BARGE_IN_GRACE_MS) {
+          preCancelFired = true;
+          cancelAndClearTwilio(); // Roy stops NOW
+          console.log("🛑 INSTANT CANCEL: Caller speaking - Roy SHUT UP!");
+        }
       }
     }
 
