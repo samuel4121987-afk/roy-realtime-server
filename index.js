@@ -143,7 +143,6 @@ wss.on("connection", (twilioSocket) => {
     sendToOpenAI({
       type: "response.create",
       response: {
-        output_audio_format: "g711_ulaw",
         instructions:
           "Start of call. Say EXACTLY this greeting and nothing else: '24/7 AI, this is Roy. How can I help you?'"
       }
@@ -186,7 +185,6 @@ wss.on("connection", (twilioSocket) => {
     sendToOpenAI({
       type: "response.create",
       response: {
-        output_audio_format: "g711_ulaw",
         instructions: scopeInstruction()
       }
     });
@@ -210,7 +208,6 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({
         type: "response.create",
         response: {
-          output_audio_format: "g711_ulaw",
           instructions:
             currentLang === "es"
               ? `Responde SOLO sobre 24/7 AI. El usuario dijo una muletilla. Responde muy breve: 'Vale' o 'Entendido' y espera.`
