@@ -26,7 +26,7 @@ You are Roy, the receptionist for the company "24/7 AI".
 ## Listening and Interruptions
 - Focus only on the main caller.
 - If the caller says filler while you are speaking (e.g., "yeah", "ok", "uh-huh", "aha", "sí", "vale"), do NOT stop—continue.
-- Only stop mid-sentence if the caller asks a real question.
+- If the caller asks a real question while you are speaking, stop immediately, listen, and answer.
 
 ## Scope
 - Only discuss 24/7 AI: receptionist coverage, bookings/reservations, lead capture, onboarding, setup, and basic pricing.
@@ -140,11 +140,13 @@ function isStrongQuestion(text) {
   const w = wordsOf(raw);
   const cleanedLen = normalizeText(raw).length;
 
+  // Avoid cancelling on tiny echo fragments like “what”
   if (w.length < 3 && cleanedLen < 12) return false;
+
   return looksLikeQuestion(raw);
 }
 
-/** ---------------- Anti-echo guard (prevents Roy replying to himself) ---------------- **/
+/** ---------------- Anti-echo guard ---------------- **/
 
 function isEchoOfAssistant(transcript, lastAssistantText) {
   const t = normalizeText(transcript);
@@ -165,17 +167,15 @@ function isEchoOfAssistant(transcript, lastAssistantText) {
   return false;
 }
 
-/** ---------------- NEW: Strong “near-duplicate” user dedupe ---------------- **/
+/** ---------------- Near-duplicate user dedupe ---------------- **/
 
 const STOPWORDS = new Set([
-  // EN
   "i","im","i'm","am","are","is","was","were","be","been","being",
   "a","an","the","and","or","but","so","to","of","for","in","on","at","with","from",
   "it","this","that","these","those",
   "you","your","yours","me","my","mine","we","our","ours","they","their","theirs",
   "hey","hi","hello","roy",
   "hows","how's","how","whats","what's","what","going",
-  // ES (basic)
   "yo","tu","tú","usted","ustedes","mi","mis","me","mio","mía","mias","míos",
   "el","la","los","las","un","una","unos","unas","y","o","pero","si","sí",
   "de","del","al","en","con","por","para","a","es","son","soy","eres","estoy",
@@ -197,27 +197,21 @@ function overlapSimilarity(aWords, bWords) {
 }
 
 function isNearDuplicateUserTranscript(curr, lastRaw, lastAtMs, nowMs) {
-  const WINDOW_MS = 4200; // tuned for your “beginning of call” double-transcription
+  const WINDOW_MS = 4200;
   if (!lastRaw || (nowMs - lastAtMs) > WINDOW_MS) return false;
 
   const cNorm = normalizeText(curr);
   const lNorm = normalizeText(lastRaw);
 
   if (!cNorm) return true;
-
-  // Exact / containment
   if (cNorm === lNorm) return true;
   if (cNorm.length >= 10 && (cNorm.includes(lNorm) || lNorm.includes(cNorm))) return true;
 
-  // Content-word overlap
   const cW = contentWords(cNorm);
   const lW = contentWords(lNorm);
-
-  // If both are basically greetings/smalltalk with no content words, treat as duplicate
   if (cW.length === 0 && lW.length === 0) return true;
 
-  const sim = overlapSimilarity(cW, lW);
-  return sim >= 0.65;
+  return overlapSimilarity(cW, lW) >= 0.65;
 }
 
 /** ---------------------------------------------------------------------- **/
@@ -263,7 +257,6 @@ wss.on("connection", (twilioSocket) => {
 
   let lastAssistantText = "";
 
-  // Dedupe state
   let lastUserRaw = "";
   let lastUserAtMs = 0;
 
@@ -370,14 +363,17 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
 
+    // Mark potential interruption when caller speech starts while Roy talks
     if (evt.type === "input_audio_buffer.speech_started") {
       if (isAISpeaking || responseInFlight) pendingBargeIn = true;
     }
 
+    // Commit on speech stop so transcription completes
     if (evt.type === "input_audio_buffer.speech_stopped") {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
+    // Audio back to Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
@@ -388,6 +384,7 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
+    // Handle caller transcript
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; return; }
@@ -398,7 +395,7 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
-      // Drop near-duplicate user transcripts (fixes “answers twice”)
+      // Drop near-duplicates
       const nowMs = Date.now();
       if (isNearDuplicateUserTranscript(transcript, lastUserRaw, lastUserAtMs, nowMs)) {
         pendingBargeIn = false;
@@ -410,14 +407,21 @@ wss.on("connection", (twilioSocket) => {
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // Only interrupt Roy for real questions
-      if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
-        if (!filler && strongQ) {
-          cancelAndClearTwilio();
-          pendingBargeIn = false;
-          injectUserTextAndRespond(transcript);
-          return;
-        }
+      const aiCurrentlyTalking = (isAISpeaking || responseInFlight);
+
+      // ✅ FIX #1: If Roy is talking and you asked a real question, cancel immediately
+      // even if pendingBargeIn wasn’t set (VAD timing issue).
+      if (aiCurrentlyTalking && !filler && strongQ) {
+        cancelAndClearTwilio();
+        pendingBargeIn = false;
+        injectUserTextAndRespond(transcript);
+        return;
+      }
+
+      // ✅ FIX #2: keep your original “only interrupt if we detected barge-in”
+      // (this now mainly protects against noise/filler)
+      if (aiCurrentlyTalking && pendingBargeIn) {
+        // If it was filler or not a strong question, ignore and let Roy continue
         pendingBargeIn = false;
         return;
       }
