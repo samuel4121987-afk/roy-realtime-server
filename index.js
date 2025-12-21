@@ -211,12 +211,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo",
         temperature: 0.7,
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.75, // Increased from 0.65 to reduce false positives
-          prefix_padding_ms: 300,
-          silence_duration_ms: 800
-        },
+        turn_detection: null, // DISABLED - using manual turn-taking
         max_response_output_tokens: 150,
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -279,6 +274,10 @@ wss.on("connection", (twilioSocket) => {
     // Track when AI finishes speaking
     if (evt.type === "response.audio.done") {
       isAISpeaking = false;
+      
+      // MANUAL TURN-TAKING: Commit any buffered audio after Roy finishes
+      console.log("✅ Roy finished speaking - committing audio buffer");
+      sendToOpenAI({ type: "input_audio_buffer.commit" });
 
       // If something was queued, handle it now (only if not canceling)
       if (queuedTranscript && !responseInFlight && !cancelInProgress) {
