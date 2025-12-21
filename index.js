@@ -306,10 +306,12 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcription -> ONLY interrupt for real questions (not filler)
+    // Handle transcription -> ONLY respond when Roy is NOT speaking
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
+
+      console.log("📝 Transcript:", transcript);
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
@@ -318,6 +320,7 @@ wss.on("connection", (twilioSocket) => {
       if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
         // Only cancel if it's a REAL question (and not filler)
         if (!filler && strongQ) {
+          console.log("✅ Real question during Roy speaking - canceling and responding");
           cancelAndClearTwilio();
           pendingBargeIn = false;
           preCancelFired = false;
@@ -326,28 +329,22 @@ wss.on("connection", (twilioSocket) => {
         }
 
         // Not a real question -> ignore (Roy continues)
+        console.log("🔇 Filler word during Roy speaking - ignoring");
         pendingBargeIn = false;
         preCancelFired = false;
         return;
       }
 
-      // If we already pre-canceled (so Roy stopped instantly), now decide what to do.
+      // If we already pre-canceled, IGNORE the transcript (Roy's own voice)
       if (preCancelFired) {
+        console.log("🚫 IGNORING transcript after pre-cancel (Roy's own voice)");
         pendingBargeIn = false;
         preCancelFired = false;
-
-        // If it was filler, just acknowledge briefly.
-        if (filler) {
-          injectUserTextAndRespond("Okay.");
-          return;
-        }
-
-        // Otherwise answer normally (question or statement)
-        injectUserTextAndRespond(transcript);
         return;
       }
 
       // If Roy is not talking: respond normally
+      console.log("✅ Roy not speaking - responding normally");
       pendingBargeIn = false;
       preCancelFired = false;
       injectUserTextAndRespond(transcript);
