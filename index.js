@@ -11,9 +11,6 @@ if (!OPENAI_API_KEY) {
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-/**
- * REVERTED PROMPT (the “working” one you liked)
- */
 const ROY_PROMPT = `
 You are Roy, the receptionist for the company "24/7 AI".
 
@@ -119,7 +116,6 @@ function looksLikeQuestion(text) {
     "is","are","am","was","were",
     "will","would","should",
     "tell","explain",
-    // Spanish common
     "qué","que","cómo","como","cuándo","cuando","dónde","donde","cuánto","cuanto",
     "puedo","puede","podría","podria"
   ]);
@@ -160,30 +156,68 @@ function isEchoOfAssistant(transcript, lastAssistantText) {
 
   const tw = wordsOf(t);
   const aw = new Set(wordsOf(a));
-  if (tw.length > 0 && tw.length <= 6) {
+  if (tw.length > 0 && tw.length <= 7) {
     let hit = 0;
     for (const w of tw) if (aw.has(w)) hit++;
-    if (hit / tw.length >= 0.8) return true;
+    if (hit / tw.length >= 0.85) return true;
   }
 
   return false;
 }
 
-/** ---------------- NEW: Duplicate transcript guard (prevents double answers) ---------------- **/
+/** ---------------- NEW: Strong “near-duplicate” user dedupe ---------------- **/
 
-function isDuplicateUserTranscript(curr, lastNorm, lastAtMs, nowMs) {
-  const n = normalizeText(curr);
-  if (!n) return true;
+const STOPWORDS = new Set([
+  // EN
+  "i","im","i'm","am","are","is","was","were","be","been","being",
+  "a","an","the","and","or","but","so","to","of","for","in","on","at","with","from",
+  "it","this","that","these","those",
+  "you","your","yours","me","my","mine","we","our","ours","they","their","theirs",
+  "hey","hi","hello","roy",
+  "hows","how's","how","whats","what's","what","going",
+  // ES (basic)
+  "yo","tu","tú","usted","ustedes","mi","mis","me","mio","mía","mias","míos",
+  "el","la","los","las","un","una","unos","unas","y","o","pero","si","sí",
+  "de","del","al","en","con","por","para","a","es","son","soy","eres","estoy",
+  "hola","buenas"
+]);
 
-  // Only dedupe within a short window
-  const WINDOW_MS = 2200;
-  if (!lastNorm || (nowMs - lastAtMs) > WINDOW_MS) return false;
+function contentWords(text) {
+  return wordsOf(text).filter(w => !STOPWORDS.has(w));
+}
 
-  // Exact match or near-match (one contains the other)
-  if (n === lastNorm) return true;
-  if (n.length >= 10 && (n.includes(lastNorm) || lastNorm.includes(n))) return true;
+function overlapSimilarity(aWords, bWords) {
+  if (!aWords.length || !bWords.length) return 0;
+  const aSet = new Set(aWords);
+  const bSet = new Set(bWords);
+  let inter = 0;
+  for (const w of aSet) if (bSet.has(w)) inter++;
+  const union = new Set([...aSet, ...bSet]).size;
+  return union ? inter / union : 0;
+}
 
-  return false;
+function isNearDuplicateUserTranscript(curr, lastRaw, lastAtMs, nowMs) {
+  const WINDOW_MS = 4200; // tuned for your “beginning of call” double-transcription
+  if (!lastRaw || (nowMs - lastAtMs) > WINDOW_MS) return false;
+
+  const cNorm = normalizeText(curr);
+  const lNorm = normalizeText(lastRaw);
+
+  if (!cNorm) return true;
+
+  // Exact / containment
+  if (cNorm === lNorm) return true;
+  if (cNorm.length >= 10 && (cNorm.includes(lNorm) || lNorm.includes(cNorm))) return true;
+
+  // Content-word overlap
+  const cW = contentWords(cNorm);
+  const lW = contentWords(lNorm);
+
+  // If both are basically greetings/smalltalk with no content words, treat as duplicate
+  if (cW.length === 0 && lW.length === 0) return true;
+
+  const sim = overlapSimilarity(cW, lW);
+  return sim >= 0.65;
 }
 
 /** ---------------------------------------------------------------------- **/
@@ -227,11 +261,10 @@ wss.on("connection", (twilioSocket) => {
   let responseInFlight = false;
   let pendingBargeIn = false;
 
-  // Store last assistant text (for echo detection)
   let lastAssistantText = "";
 
-  // NEW: store last processed user transcript (for duplicate detection)
-  let lastUserNorm = "";
+  // Dedupe state
+  let lastUserRaw = "";
   let lastUserAtMs = 0;
 
   function sendToOpenAI(obj) {
@@ -328,7 +361,6 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Track assistant text (for echo detection)
     if (evt.type === "response.text.done" && typeof evt.text === "string") {
       lastAssistantText = evt.text;
     }
@@ -360,25 +392,25 @@ wss.on("connection", (twilioSocket) => {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; return; }
 
-      // 1) Drop assistant echo
+      // Drop assistant echo
       if (isEchoOfAssistant(transcript, lastAssistantText)) {
         pendingBargeIn = false;
         return;
       }
 
-      // 2) Drop duplicate user transcript (prevents double answers)
+      // Drop near-duplicate user transcripts (fixes “answers twice”)
       const nowMs = Date.now();
-      if (isDuplicateUserTranscript(transcript, lastUserNorm, lastUserAtMs, nowMs)) {
+      if (isNearDuplicateUserTranscript(transcript, lastUserRaw, lastUserAtMs, nowMs)) {
         pendingBargeIn = false;
         return;
       }
-      lastUserNorm = normalizeText(transcript);
+      lastUserRaw = transcript;
       lastUserAtMs = nowMs;
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If caller tried to interrupt while Roy was talking:
+      // Only interrupt Roy for real questions
       if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
         if (!filler && strongQ) {
           cancelAndClearTwilio();
@@ -406,9 +438,8 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
 
-  // Keep your base EXACTLY (as you said it works for you)
   const isCallerAudio = (track) => {
-    if (!track) return false; // reject audio without track
+    if (!track) return false;
     return track === "inbound" || track === "inbound_track";
   };
 
