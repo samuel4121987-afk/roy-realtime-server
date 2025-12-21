@@ -12,9 +12,7 @@ const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
 /**
- * REVERTED PROMPT (back a bit):
- * - Keeps free trial closing flow + yes/no examples
- * - Removes the later “acceptance lock” tightening (reverted)
+ * REVERTED PROMPT (the “working” one you liked)
  */
 const ROY_PROMPT = `
 You are Roy, the receptionist for the company "24/7 AI".
@@ -66,18 +64,6 @@ Step 4 (If they say YES / OK / fine / sure / why not):
 "Just to confirm: name __, email __, phone __ — is that correct?"
 - If confirmed:
 "Perfect—I’ll send it to your email. Thanks for calling, have a great day."
-
-## YES / NO phrase recognition (interpret intent)
-Treat these as YES / ACCEPT:
-- "yes", "yeah", "yep", "sure", "okay", "ok", "alright", "fine", "why not", "let's do it", "go ahead",
-- "sounds good", "I'll try", "I'll test it", "send it"
-Spanish YES:
-- "sí", "si", "claro", "vale", "de acuerdo", "perfecto", "ok", "dale", "vamos", "por qué no"
-
-Treat these as NO / REFUSE:
-- "no", "nope", "nah", "not interested", "not now", "maybe later", "I don't want", "I’m good", "no thanks"
-Spanish NO:
-- "no", "no gracias", "no me interesa", "ahora no", "quizá después", "estoy bien"
 
 ## Do not loop
 - Never offer the free trial more than once per call.
@@ -162,7 +148,7 @@ function isStrongQuestion(text) {
   return looksLikeQuestion(raw);
 }
 
-/** ---------------- NEW: Anti-echo guard (prevents Roy replying to himself) ---------------- **/
+/** ---------------- Anti-echo guard (prevents Roy replying to himself) ---------------- **/
 
 function isEchoOfAssistant(transcript, lastAssistantText) {
   const t = normalizeText(transcript);
@@ -170,11 +156,8 @@ function isEchoOfAssistant(transcript, lastAssistantText) {
 
   if (!t || !a) return false;
 
-  // If transcript is basically contained in last assistant output (or vice versa), treat as echo.
-  // Example: "i am doing good" matching the assistant’s own prior line.
   if (t.length >= 8 && (a.includes(t) || t.includes(a))) return true;
 
-  // If very short + overlaps heavily with assistant text, also likely echo.
   const tw = wordsOf(t);
   const aw = new Set(wordsOf(a));
   if (tw.length > 0 && tw.length <= 6) {
@@ -182,6 +165,23 @@ function isEchoOfAssistant(transcript, lastAssistantText) {
     for (const w of tw) if (aw.has(w)) hit++;
     if (hit / tw.length >= 0.8) return true;
   }
+
+  return false;
+}
+
+/** ---------------- NEW: Duplicate transcript guard (prevents double answers) ---------------- **/
+
+function isDuplicateUserTranscript(curr, lastNorm, lastAtMs, nowMs) {
+  const n = normalizeText(curr);
+  if (!n) return true;
+
+  // Only dedupe within a short window
+  const WINDOW_MS = 2200;
+  if (!lastNorm || (nowMs - lastAtMs) > WINDOW_MS) return false;
+
+  // Exact match or near-match (one contains the other)
+  if (n === lastNorm) return true;
+  if (n.length >= 10 && (n.includes(lastNorm) || lastNorm.includes(n))) return true;
 
   return false;
 }
@@ -227,8 +227,12 @@ wss.on("connection", (twilioSocket) => {
   let responseInFlight = false;
   let pendingBargeIn = false;
 
-  // NEW: store last assistant text (for echo detection)
+  // Store last assistant text (for echo detection)
   let lastAssistantText = "";
+
+  // NEW: store last processed user transcript (for duplicate detection)
+  let lastUserNorm = "";
+  let lastUserAtMs = 0;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -298,7 +302,6 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
-    // If Twilio start already arrived, greet immediately.
     if (streamSid) {
       sendToOpenAI({
         type: "conversation.item.create",
@@ -325,7 +328,7 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Track assistant text so we can drop echo-transcripts
+    // Track assistant text (for echo detection)
     if (evt.type === "response.text.done" && typeof evt.text === "string") {
       lastAssistantText = evt.text;
     }
@@ -357,15 +360,25 @@ wss.on("connection", (twilioSocket) => {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; return; }
 
-      // NEW: drop echo of Roy’s own last output
+      // 1) Drop assistant echo
       if (isEchoOfAssistant(transcript, lastAssistantText)) {
         pendingBargeIn = false;
         return;
       }
 
+      // 2) Drop duplicate user transcript (prevents double answers)
+      const nowMs = Date.now();
+      if (isDuplicateUserTranscript(transcript, lastUserNorm, lastUserAtMs, nowMs)) {
+        pendingBargeIn = false;
+        return;
+      }
+      lastUserNorm = normalizeText(transcript);
+      lastUserAtMs = nowMs;
+
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
+      // If caller tried to interrupt while Roy was talking:
       if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
         if (!filler && strongQ) {
           cancelAndClearTwilio();
