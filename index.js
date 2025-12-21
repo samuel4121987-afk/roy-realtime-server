@@ -120,11 +120,24 @@ wss.on("connection", (twilioSocket) => {
   let pendingBargeIn = false;
   const BARGE_IN_DEBOUNCE_MS = 160;
   let cancelCooldownUntil = 0;
-  const CANCEL_COOLDOWN_MS = 250;
+  const CANCEL_COOLDOWN_MS = 350;
   
   // Minimum inbound audio gate to prevent false cancels from echo/noise
   let inboundAudioCounter = 0;
-  const MIN_INBOUND_AUDIO_THRESHOLD = 3200; // ~200ms of audio at 8kHz
+  const MIN_INBOUND_AUDIO_THRESHOLD = 2000; // ~120-250ms of real decoded audio
+  
+  // Grace window to prevent echo cancels right after Roy starts speaking
+  let aiSpeechStartedAt = 0;
+  const BARGE_IN_GRACE_MS = 450;
+  
+  // Prevent overlapping responses
+  let responseInFlight = false;
+
+  // NEW: queue transcript if it arrives while Roy is still speaking
+  let queuedTranscript = null;
+  
+  // NEW: block new responses during cancel flush
+  let cancelInProgress = false;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -141,6 +154,41 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
+  function safeCreateResponseFromTranscript(transcript) {
+    // Never start a new response while Roy is speaking, in-flight, or canceling
+    if (cancelInProgress || isAISpeaking || responseInFlight) {
+      queuedTranscript = transcript;
+      console.log("⏸️ Queuing transcript (speaking/inflight/canceling)");
+      return;
+    }
+
+    const filler = isOnlyFillerWords(transcript);
+
+    if (filler) {
+      sendToOpenAI({
+        type: "response.create",
+        response: {
+          instructions: "Caller utterance was a brief acknowledgment like 'yeah' or 'okay'. Reply very briefly (just 'Got it' or 'Okay') and continue the prior topic with ONE new sentence."
+        }
+      });
+    } else {
+      sendToOpenAI({
+        type: "response.create",
+        response: {
+          instructions: "Caller utterance is a real message or question. Answer directly and briefly (1–2 sentences). If unclear, ask one short clarification question."
+        }
+      });
+    }
+  }
+  
+  function requestCancelAndFlush() {
+    cancelInProgress = true;
+    sendToOpenAI({ type: "response.cancel" });
+    twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
+    cancelCooldownUntil = Date.now() + CANCEL_COOLDOWN_MS;
+    // Do NOT set isAISpeaking=false here; let audio.done / response.done settle it
+  }
+
   const openaiSocket = new WebSocket(OPENAI_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -152,7 +200,8 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // Configure session
+    // Configure session with server VAD for speech detection
+    // BUT we use transcript-based confirmation before canceling (prevents echo false-positives)
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -195,71 +244,78 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Handle speech started - DEBOUNCED barge-in (avoid false triggers from noise)
+    // Speech started: mark possible barge-in (don't cancel yet)
     if (evt.type === "input_audio_buffer.speech_started") {
-      console.log("👂 User speech detected");
+      if (!isAISpeaking) return;
       
-      // Only interrupt if Roy is currently speaking
-      if (!isAISpeaking) {
-        console.log("👂 User started speaking (Roy not speaking)");
+      if (Date.now() < cancelCooldownUntil) return;
+      
+      if (Date.now() - aiSpeechStartedAt < BARGE_IN_GRACE_MS) {
         return;
       }
       
-      const now = Date.now();
-      if (now < cancelCooldownUntil) return;
-      
       pendingBargeIn = true;
-      inboundAudioCounter = 0; // Reset counter for minimum audio gate
+      inboundAudioCounter = 0;
       
       if (bargeTimer) clearTimeout(bargeTimer);
       bargeTimer = setTimeout(() => {
-        if (!pendingBargeIn) return;
-        
-        // Only cancel if we received enough real inbound audio (not just echo/noise)
-        if (inboundAudioCounter < MIN_INBOUND_AUDIO_THRESHOLD) {
-          console.log(`⚠️ Insufficient inbound audio (${inboundAudioCounter} bytes) - ignoring barge-in`);
-          pendingBargeIn = false;
-          return;
-        }
-        
-        console.log(`🛑 User speaking (debounced, ${inboundAudioCounter} bytes) - stopping Roy`);
-        sendToOpenAI({ type: "response.cancel" });
-        twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
-        
-        isAISpeaking = false;
-        pendingBargeIn = false;
-        inboundAudioCounter = 0;
-        cancelCooldownUntil = Date.now() + CANCEL_COOLDOWN_MS;
+        // Transcript will decide.
       }, BARGE_IN_DEBOUNCE_MS);
     }
     
-    // Handle speech stopped - clear pending barge-in and commit buffer
+    // Speech stopped: commit buffer (keep pendingBargeIn until transcript)
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      pendingBargeIn = false;
-      inboundAudioCounter = 0;
       if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = null; }
-      
-      console.log("🤫 User stopped speaking - committing audio buffer");
       sendToOpenAI({ type: "input_audio_buffer.commit" });
-      // Response will be created after transcription completes
     }
 
     // Track when AI starts speaking
     if (evt.type === "response.audio.started") {
       isAISpeaking = true;
+      aiSpeechStartedAt = Date.now();
       console.log("🎙️ Roy started speaking");
     }
 
     // Track when AI finishes speaking
     if (evt.type === "response.audio.done") {
       isAISpeaking = false;
-      console.log("✅ Roy finished speaking");
+
+      // If something was queued, handle it now (only if not canceling)
+      if (queuedTranscript && !responseInFlight && !cancelInProgress) {
+        const t = queuedTranscript;
+        queuedTranscript = null;
+        safeCreateResponseFromTranscript(t);
+      }
+    }
+    
+    // Response lifecycle
+    if (evt.type === "response.created") responseInFlight = true;
+    
+    if (evt.type === "response.done") {
+      responseInFlight = false;
+      
+      // If we canceled, the cancel "flush" is now complete
+      if (cancelInProgress) {
+        cancelInProgress = false;
+        console.log("✅ Cancel flush complete (response.done)");
+      }
+      
+      // If something was queued, handle it now (safe point)
+      if (queuedTranscript && !isAISpeaking && !responseInFlight && !cancelInProgress) {
+        const t = queuedTranscript;
+        queuedTranscript = null;
+        safeCreateResponseFromTranscript(t);
+      }
     }
 
-    // Stream audio deltas back to Twilio (no marks)
-    if (evt.type === "response.audio.delta" && evt.delta) {
-      // Set isAISpeaking on first audio delta for consistency
-      if (!isAISpeaking) isAISpeaking = true;
+    // Audio to Twilio
+    if (
+      (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
+      evt.delta
+    ) {
+      // IMPORTANT: do NOT flip isAISpeaking=true here; rely on response.audio.started
+      // Also ignore deltas while cancel is flushing (these are stale frames)
+      if (cancelInProgress) return;
       
       twilioSocket.send(JSON.stringify({
         event: "media",
@@ -268,30 +324,33 @@ wss.on("connection", (twilioSocket) => {
       }));
     }
 
-    // Handle transcription - create response based on what user said
+    // Transcription completed
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      lastUserTranscript = (evt.transcript || "").trim();
-      console.log(`👤 User said: "${lastUserTranscript}"`);
-      
-      const isFiller = isOnlyFillerWords(lastUserTranscript);
-      
-      if (isFiller) {
-        console.log("💬 Filler detected - brief acknowledgment");
-        sendToOpenAI({
-          type: "response.create",
-          response: {
-            instructions: "Caller utterance was a brief acknowledgment like 'yeah' or 'okay'. Reply very briefly (just 'Got it' or 'Okay') and continue the prior topic with ONE new sentence."
-          }
-        });
-      } else {
-        console.log("❓ Real message - answering");
-        sendToOpenAI({
-          type: "response.create",
-          response: {
-            instructions: "Caller utterance is a real message or question. Answer directly and briefly (1–2 sentences). If unclear, ask one short clarification question."
-          }
-        });
+      const transcript = (evt.transcript || "").trim();
+      console.log(`👤 User said: "${transcript}"`);
+
+      // If barge-in was detected while Roy spoke, confirm here
+      if (pendingBargeIn) {
+        const filler = isOnlyFillerWords(transcript);
+
+        if (!filler && inboundAudioCounter >= MIN_INBOUND_AUDIO_THRESHOLD) {
+          console.log(`🛑 Confirmed barge-in: "${transcript}" -> cancel now`);
+          requestCancelAndFlush();
+
+          // Queue the transcript to respond AFTER cancel flush completes
+          queuedTranscript = transcript;
+
+          pendingBargeIn = false;
+          inboundAudioCounter = 0;
+          return; // CRITICAL: do NOT create response now
+        }
+
+        pendingBargeIn = false;
+        inboundAudioCounter = 0;
       }
+
+      // Normal path: respond safely (or queue if speaking/inflight/canceling)
+      safeCreateResponseFromTranscript(transcript);
     }
 
     if (evt.type === "response.text.done") {
@@ -301,9 +360,8 @@ wss.on("connection", (twilioSocket) => {
 
   openaiSocket.on("close", (c, r) => {
     console.error("❌ OpenAI WS closed", c, r ? r.toString() : "");
-    if (twilioSocket.readyState === WebSocket.OPEN) {
-      twilioSocket.close();
-    }
+    // Do NOT close the Twilio socket here. Keep the call alive.
+    // In production, you could play a fallback TTS message here.
   });
 
   openaiSocket.on("error", (e) => {
@@ -359,8 +417,9 @@ wss.on("connection", (twilioSocket) => {
       if (!payload) return;
 
       // Track inbound audio for minimum audio gate (prevents false barge-in from echo/noise)
+      // Convert base64 length to decoded bytes (base64 is ~4/3 larger than raw)
       if (pendingBargeIn) {
-        inboundAudioCounter += payload.length;
+        inboundAudioCounter += Math.floor((payload.length * 3) / 4);
       }
 
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
