@@ -87,10 +87,10 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // HARD GATE: do not send ANY audio to Twilio until OpenAI confirms μ-law output
+  // Audio gate: allow sending only after we're confident audio is usable
   let audioReady = false;
 
-  // Flow state
+  // Greeting flow
   let greeted = false;
   let greetRequested = false;
 
@@ -126,7 +126,7 @@ wss.on("connection", (twilioSocket) => {
     if (greeted) return;
     if (!streamSid) return;
     if (!openaiOpen) return;
-    if (!audioReady) return; // CRITICAL: prevents static until μ-law confirmed
+    if (!audioReady) return;
 
     greeted = true;
     greetRequested = false;
@@ -134,7 +134,6 @@ wss.on("connection", (twilioSocket) => {
     sendToOpenAI({
       type: "response.create",
       response: {
-        // Force μ-law again per-response
         output_audio_format: "g711_ulaw",
         instructions:
           "Start of call. Say EXACTLY this greeting and nothing else: '24/7 AI, this is Roy. How can I help you?'"
@@ -192,7 +191,7 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // Configure session: must be μ-law in/out
+    // Configure session: μ-law in/out
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -213,6 +212,15 @@ wss.on("connection", (twilioSocket) => {
       }
     });
 
+    // Fallback: if the server doesn't echo formats, don't brick audio.
+    setTimeout(() => {
+      if (!audioReady) {
+        console.log("⚠️ audioReady fallback -> true (prevent silence)");
+        audioReady = true;
+        maybeDoGreeting();
+      }
+    }, 1200);
+
     flushOpenAIQueue();
   });
 
@@ -224,7 +232,7 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Verify session actually applied audio format
+    // Session confirmation (but don't block if fields are missing)
     if (evt.type === "session.created" || evt.type === "session.updated") {
       const s = evt.session || {};
       const outFmt = s.output_audio_format;
@@ -236,16 +244,19 @@ wss.on("connection", (twilioSocket) => {
         voice: s.voice
       });
 
-      // HARD REQUIREMENT: only proceed if output is truly μ-law
-      if (outFmt === "g711_ulaw") {
+      // If server doesn't include formats, allow audio to avoid silence.
+      if (outFmt == null) {
+        console.log("⚠️ output_audio_format missing; allowing audio");
+        audioReady = true;
+        maybeDoGreeting();
+      } else if (outFmt === "g711_ulaw") {
         audioReady = true;
         console.log("✅ audioReady = true (μ-law confirmed)");
         maybeDoGreeting();
       } else {
         audioReady = false;
-        console.log("❌ audioReady = false (output not μ-law) -> re-applying session.update");
+        console.log("❌ output not μ-law -> re-applying session.update");
 
-        // Re-apply session.update until it sticks
         sendToOpenAI({
           type: "session.update",
           session: {
@@ -271,19 +282,12 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "response.created") responseInFlight = true;
     if (evt.type === "response.done") responseInFlight = false;
 
-    if (evt.type === "response.audio.started") {
-      isAISpeaking = true;
-    }
-    if (evt.type === "response.audio.done") {
-      isAISpeaking = false;
-    }
+    if (evt.type === "response.audio.started") isAISpeaking = true;
+    if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    // DO NOT send audio unless audioReady is true
+    // Send audio deltas to Twilio only when ready
     if (evt.type === "response.audio.delta" && evt.delta) {
-      if (!audioReady) {
-        console.log("🚫 Dropping audio delta (audioReady=false) to prevent static");
-        return;
-      }
+      if (!audioReady) return;
       if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
         twilioSocket.send(
           JSON.stringify({
