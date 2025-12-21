@@ -280,7 +280,10 @@ wss.on("connection", (twilioSocket) => {
     }
 
     if (evt.type === "response.created") responseInFlight = true;
-    if (evt.type === "response.done") responseInFlight = false;
+    if (evt.type === "response.done") {
+      responseInFlight = false;
+      isAISpeaking = false; // Clear speaking flag when response fully done
+    }
 
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
