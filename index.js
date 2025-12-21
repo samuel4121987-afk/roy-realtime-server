@@ -12,28 +12,28 @@ const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
 /**
- * NOTE (kept minimal): I removed the “never reveal you are AI / prohibited topics” instruction.
- * You can still say “24/7 AI” as the company name and act like a receptionist,
- * but you can’t hard-instruct deceptive impersonation.
+ * NOTE (kept minimal): I removed the "never reveal you are AI / prohibited topics" instruction.
+ * You can still say "24/7 AI" as the company name and act like a receptionist,
+ * but you can't hard-instruct deceptive impersonation.
  */
 const ROY_PROMPT = `
 You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
 ## Immediate Greeting
-- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): “24/7 AI, this is Roy. How can I help you?” Begin speaking as soon as the call starts.
+- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): "24/7 AI, this is Roy. How can I help you?" Begin speaking as soon as the call starts.
 - Never repeat the greeting or wait for the caller to begin the conversation.
 
 ## Tone and Style
-- Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as “I’m,” “we’ll,” “don’t”), and prefer casual phrasing.
+- Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
 - Maintain a confident, friendly, and relaxed tone. Do not sound robotic or overly formal. Pace yourself steadily with natural intonation at all times.
 
 ## Listening and Interruptions
 - Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
-- When the caller says filler words (e.g., “yes,” “uh-huh,” “okay,” “aha,” etc.) while you are speaking, do not pause—continue your response naturally.
+- When the caller says filler words (e.g., "yes," "uh-huh," "okay," "aha," etc.) while you are speaking, do not pause—continue your response naturally.
 - Only stop talking mid-sentence if the caller clearly asks a question. Promptly listen, then answer their question directly and succinctly.
 
 ## Noise and Multiple Voices
-- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: “I’m sorry, there’s some noise. Could you repeat that or find a quieter place?” Ask only this, then return to the conversation.
+- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: "I'm sorry, there's some noise. Could you repeat that or find a quieter place?" Ask only this, then return to the conversation.
 - Never react to background chatter.
 
 ## Language Adaptation
@@ -43,14 +43,24 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 - When asked about services, reply clearly that 24/7 AI Assistant provides continuous receptionist coverage for hotels, vacation rentals, medical clinics, hair salons & spas, small businesses, and professional services.
 - Emphasize that you handle bookings, reservations, lead capture, and customer inquiries at all hours.
 - Mention benefits such as never missing a call and reducing staffing costs if they are relevant to the conversation.
-- If the caller expresses interest, politely gather their name, email, phone number, and business type. Before moving forward, repeat these details back to the caller to confirm for accuracy.
+
+## Free Trial Offer and Contact Collection (CRITICAL)
+- ALWAYS offer a free trial before ending any call. Never end a call without attempting to collect contact information.
+- When the caller shows ANY interest or asks questions about the service, immediately offer: "I'd love to set you up with a free trial so you can see how it works for your business. Can I grab your name, email, phone number, and what country you're calling from?"
+- If the caller declines the first time, push once more by saying: "I totally understand, but here's the thing—you won't be losing anything. It's completely free, and if you don't subscribe, the trial will just suspend on its own at the end. No commitment. Can I just get your details real quick?"
+- If the caller declines a second time, make ONE final attempt: "No pressure at all, but just so you know—it's risk-free and takes just a second. Your name, email, phone, and country—that's all I need. What do you say?"
+- ONLY after the caller says "no" THREE times should you stop pushing and end the call politely.
+- When collecting information, gather: name, email address, phone number, and country.
+- Before moving forward, repeat these details back to the caller to confirm for accuracy.
 
 ## Ending the Call
+- NEVER end a call without first attempting to collect contact information and offer the free trial (see above).
+- Only end the call politely after three "no" responses, or after successfully collecting the caller's information.
 - Before ending the conversation, confirm any collected contact information by repeating it back to the caller for verification.
-- When closing, use a friendly, casual farewell suited to the tone of the call, such as: “Thank you for calling. Have a great day.”
+- When closing, use a friendly, casual farewell suited to the tone of the call, such as: "Thank you for calling. Have a great day."
 
 ## Transparency
-- If asked directly, be honest you’re the virtual receptionist for 24/7 AI.
+- If asked directly, be honest you're the virtual receptionist for 24/7 AI.
 
 Always follow these instructions for every call without exception.
 `.trim();
@@ -69,7 +79,7 @@ function normalizeText(t) {
   return (t || "")
     .toLowerCase()
     .trim()
-    .replace(/[“”]/g, '"')
+    .replace(/[""]/g, '"')
     .replace(/[.,!?;:()]/g, "");
 }
 
@@ -131,33 +141,6 @@ function isStrongQuestion(text) {
   return looksLikeQuestion(raw);
 }
 
-/**
- * NEW (SAFE): "obvious question" test used only when VAD misses pendingBargeIn.
- * This avoids canceling on short echo/noise fragments.
- */
-function isObviousQuestionShape(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-
-  const hasQM = raw.includes("?");
-  const w = wordsOf(raw);
-  if (w.length === 0) return false;
-
-  const first = w[0];
-  const starters = new Set([
-    "who","what","when","where","why","how",
-    "can","could","do","does","did",
-    "is","are","am","was","were",
-    "will","would","should",
-    "tell","explain",
-    "qué","que","cómo","como","cuándo","cuando","dónde","donde","cuánto","cuanto",
-    "puedo","puede","podría","podria"
-  ]);
-
-  // require either a question mark OR a real question-starter
-  return hasQM || starters.has(first);
-}
-
 /** ------------------------------------------------------------------------- **/
 
 const app = express();
@@ -195,7 +178,7 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // MINIMAL ADD: speaking flags + “real barge-in” gating
+  // MINIMAL ADD: speaking flags + "real barge-in" gating
   let isAISpeaking = false;
   let responseInFlight = false;
   let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
@@ -298,15 +281,17 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Speaking flags (fixes “stuck speaking” / “cut off”)
+    // Speaking flags (fixes "stuck speaking" / "cut off")
     if (evt.type === "response.created") responseInFlight = true;
     if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    // Only mark pending barge-in if caller speech starts WHILE Roy is speaking
+    // Mark that caller started speaking while Roy is talking
     if (evt.type === "input_audio_buffer.speech_started") {
-      if (isAISpeaking || responseInFlight) pendingBargeIn = true;
+      if (isAISpeaking || responseInFlight) {
+        pendingBargeIn = true;
+      }
     }
 
     // Commit on speech stop so transcription completes
@@ -325,50 +310,32 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcription -> ONLY interrupt for real questions (not filler)
+    // Handle transcription -> STOP Roy if it's a real question or statement
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; return; }
 
       const filler = isOnlyFillerWords(transcript);
-      const strongQ = isStrongQuestion(transcript);
 
-      const aiTalking = (isAISpeaking || responseInFlight);
-
-      // --------- STOP YAPPING LOGIC (SAFE + MINIMAL) ---------
-      // 1) Normal path: if VAD actually detected barge-in while Roy was talking,
-      //    cancel ONLY for strong questions (not filler).
-      if (aiTalking && pendingBargeIn) {
-        if (!filler && strongQ) {
-          cancelAndClearTwilio();
+      // If caller interrupted while Roy was talking:
+      if (pendingBargeIn) {
+        // If it's just filler words ("yeah", "uh-huh"), ignore and let Roy continue
+        if (filler) {
           pendingBargeIn = false;
-          injectUserTextAndRespond(transcript);
           return;
         }
-        // filler or not a strong question -> ignore
+        
+        // It's real content (question or statement) - STOP ROY IMMEDIATELY
+        cancelAndClearTwilio();
         pendingBargeIn = false;
+        injectUserTextAndRespond(transcript);
         return;
       }
 
-      // 2) Fallback path (VAD missed pendingBargeIn):
-      //    cancel ONLY if it’s an OBVIOUS question shape AND long enough to not be echo.
-      //    This is the “make him stop yapping” fix without triggering on noise.
-      if (aiTalking && !filler && strongQ) {
-        const len = transcript.length;
-        if (isObviousQuestionShape(transcript) && len >= 18) {
-          cancelAndClearTwilio();
-          pendingBargeIn = false;
-          injectUserTextAndRespond(transcript);
-          return;
-        }
-        // otherwise ignore (safer than random cancels)
-        return;
+      // Roy wasn't talking - respond normally (but ignore pure filler)
+      if (!filler) {
+        injectUserTextAndRespond(transcript);
       }
-      // ------------------------------------------------------
-
-      // If Roy is not talking: respond normally
-      pendingBargeIn = false;
-      injectUserTextAndRespond(transcript);
     }
   });
 
