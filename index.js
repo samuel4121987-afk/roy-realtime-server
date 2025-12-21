@@ -42,8 +42,10 @@ function shouldSwitchToSpanish(transcript) {
   const t = (transcript || "").trim().toLowerCase();
   if (!t) return false;
   if (t.includes("español") || t.includes("en español") || t.includes("spanish")) return true;
+
   const words = t.split(/\s+/);
   if (words.length < 6) return false;
+
   const markers = ["hola","buenas","qué","que","cómo","como","cuánto","cuanto","precio","reservar","cita","empresa","negocio"];
   let hits = 0;
   for (const m of markers) if (t.includes(m)) hits++;
@@ -87,7 +89,7 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // Audio gate: allow sending only after we're confident audio is usable
+  // Audio gate
   let audioReady = false;
 
   // Greeting flow
@@ -191,7 +193,6 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // Configure session: μ-law in/out
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -212,7 +213,7 @@ wss.on("connection", (twilioSocket) => {
       }
     });
 
-    // Fallback: if the server doesn't echo formats, don't brick audio.
+    // Fallback: avoid silence if server doesn't echo formats
     setTimeout(() => {
       if (!audioReady) {
         console.log("⚠️ audioReady fallback -> true (prevent silence)");
@@ -232,7 +233,6 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Session confirmation (but don't block if fields are missing)
     if (evt.type === "session.created" || evt.type === "session.updated") {
       const s = evt.session || {};
       const outFmt = s.output_audio_format;
@@ -244,7 +244,6 @@ wss.on("connection", (twilioSocket) => {
         voice: s.voice
       });
 
-      // If server doesn't include formats, allow audio to avoid silence.
       if (outFmt == null) {
         console.log("⚠️ output_audio_format missing; allowing audio");
         audioReady = true;
@@ -279,16 +278,16 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
+    // --- FIX: clear isAISpeaking on response.done as well (prevents stuck speaking flag) ---
     if (evt.type === "response.created") responseInFlight = true;
     if (evt.type === "response.done") {
       responseInFlight = false;
-      isAISpeaking = false; // Clear speaking flag when response fully done
+      isAISpeaking = false; // critical: don't rely only on response.audio.done
     }
-
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
+    // -------------------------------------------------------------------------------
 
-    // Send audio deltas to Twilio only when ready
     if (evt.type === "response.audio.delta" && evt.delta) {
       if (!audioReady) return;
       if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
@@ -310,6 +309,8 @@ wss.on("connection", (twilioSocket) => {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) return;
 
+      console.log("📝 Caller said:", transcript);
+
       if (responseInFlight || isAISpeaking) return;
       createRoyResponseFromTranscript(transcript);
     }
@@ -324,8 +325,10 @@ wss.on("connection", (twilioSocket) => {
   });
 
   function isCallerAudio(track) {
-    if (!track) return false;
-    return track === "inbound" || track === "inbound_track";
+    // Twilio often omits `media.track`. If missing, treat as inbound.
+    if (!track) return true;
+    const t = String(track).toLowerCase();
+    return t.includes("inbound");
   }
 
   let trackLogged = false;
@@ -352,6 +355,7 @@ wss.on("connection", (twilioSocket) => {
         trackLogged = true;
         console.log("📞 Twilio media.track =", track || "(missing)");
       }
+
       if (!isCallerAudio(track)) return;
 
       const payload = data.media && data.media.payload;
