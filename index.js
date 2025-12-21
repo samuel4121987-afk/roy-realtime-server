@@ -177,7 +177,7 @@ wss.on("connection", (twilioSocket) => {
   // We wait for a few inbound packets so we don't cancel on tiny "yeah/ok".
   let bargePacketCount = 0;
   let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 4; // ~80ms (tune: 4-8)
+  const PRE_CANCEL_PACKETS = 2; // ~40ms - Roy stops FASTER when you speak
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
