@@ -12,28 +12,28 @@ const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
 /**
- * NOTE (kept minimal): I removed the "never reveal you are AI / prohibited topics" instruction.
- * You can still say "24/7 AI" as the company name and act like a receptionist,
- * but you can't hard-instruct deceptive impersonation.
+ * NOTE (kept minimal): I removed the “never reveal you are AI / prohibited topics” instruction.
+ * You can still say “24/7 AI” as the company name and act like a receptionist,
+ * but you can’t hard-instruct deceptive impersonation.
  */
 const ROY_PROMPT = `
 You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
 ## Immediate Greeting
-- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): "24/7 AI, this is Roy. How can I help you?" Begin speaking as soon as the call starts.
+- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): “24/7 AI, this is Roy. How can I help you?” Begin speaking as soon as the call starts.
 - Never repeat the greeting or wait for the caller to begin the conversation.
 
 ## Tone and Style
-- Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
+- Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as “I’m,” “we’ll,” “don’t”), and prefer casual phrasing.
 - Maintain a confident, friendly, and relaxed tone. Do not sound robotic or overly formal. Pace yourself steadily with natural intonation at all times.
 
 ## Listening and Interruptions
 - Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
-- When the caller says filler words (e.g., "yes," "uh-huh," "okay," "aha," etc.) while you are speaking, do not pause—continue your response naturally.
+- When the caller says filler words (e.g., “yes,” “uh-huh,” “okay,” “aha,” etc.) while you are speaking, do not pause—continue your response naturally.
 - Only stop talking mid-sentence if the caller clearly asks a question. Promptly listen, then answer their question directly and succinctly.
 
 ## Noise and Multiple Voices
-- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: "I'm sorry, there's some noise. Could you repeat that or find a quieter place?" Ask only this, then return to the conversation.
+- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: “I’m sorry, there’s some noise. Could you repeat that or find a quieter place?” Ask only this, then return to the conversation.
 - Never react to background chatter.
 
 ## Language Adaptation
@@ -47,15 +47,15 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
 ## Ending the Call
 - Before ending the conversation, confirm any collected contact information by repeating it back to the caller for verification.
-- When closing, use a friendly, casual farewell suited to the tone of the call, such as: "Thank you for calling. Have a great day."
+- When closing, use a friendly, casual farewell suited to the tone of the call, such as: “Thank you for calling. Have a great day.”
 
 ## Transparency
-- If asked directly, be honest you're the virtual receptionist for 24/7 AI.
+- If asked directly, be honest you’re the virtual receptionist for 24/7 AI.
 
 Always follow these instructions for every call without exception.
 `.trim();
 
-/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
+/** ---------------- MINIMAL ADD: filler detection ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -69,7 +69,7 @@ function normalizeText(t) {
   return (t || "")
     .toLowerCase()
     .trim()
-    .replace(/[""]/g, '"')
+    .replace(/[“”]/g, '"')
     .replace(/[.,!?;:()]/g, "");
 }
 
@@ -83,52 +83,6 @@ function isOnlyFillerWords(text) {
   if (w.length === 0) return true;
   if (w.length > 4) return false;
   return w.every(x => FILLER_WORDS.has(x));
-}
-
-function looksLikeQuestion(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-  if (raw.includes("?")) return true;
-
-  const w = wordsOf(raw);
-  if (w.length === 0) return false;
-
-  const first = w[0];
-
-  const starters = new Set([
-    "who","what","when","where","why","how",
-    "can","could","do","does","did",
-    "is","are","am","was","were",
-    "will","would","should",
-    "tell","explain",
-    // Spanish common
-    "qué","que","cómo","como","cuándo","cuando","dónde","donde","cuánto","cuanto",
-    "puedo","puede","podría","podria"
-  ]);
-
-  if (starters.has(first)) return true;
-
-  const lower = raw.toLowerCase();
-  const markers = [
-    "price","pricing","cost","charge","fee","fees","rate","rates",
-    "book","booking","reserve","reservation","schedule","setup","onboard","onboarding",
-    "how much","what is","what are",
-    "precio","coste","costo","tarifa","reservar","reserva","cita","configurar","instalar"
-  ];
-  return markers.some(m => lower.includes(m));
-}
-
-// Important: avoid false cancels from tiny echo fragments like "what", "how"
-function isStrongQuestion(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-  if (raw.includes("?")) return true;
-
-  const w = wordsOf(raw);
-  const cleanedLen = normalizeText(raw).replace(/\s+/g, " ").length;
-
-  if (w.length < 3 && cleanedLen < 12) return false;
-  return looksLikeQuestion(raw);
 }
 
 /** ------------------------------------------------------------------------- **/
@@ -168,16 +122,30 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // speaking flags + "real barge-in" gating
+  // speaking flags + barge-in gating
   let isAISpeaking = false;
   let responseInFlight = false;
-  let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
 
-  // ✅ NEW (MINIMAL): stop Roy immediately on real user talk while Roy is speaking
-  // We wait for a few inbound packets so we don't cancel on tiny "yeah/ok".
+  // barge-in capture
+  let pendingBargeIn = false;
   let bargePacketCount = 0;
+  let bargeStartedAt = 0;
   let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 1; // INSTANT - Roy stops immediately when you speak
+
+  // tune for “stop faster” but not on noise
+  const PRE_CANCEL_PACKETS = 6;    // ~120ms inbound
+  const MIN_BARGE_MS = 200;        // require sustained user speech
+  const BARGE_IN_GRACE_MS = 320;   // ignore echo immediately after Roy starts
+
+  let aiSpeechStartedAt = 0;
+
+  // transcript dedupe (prevents “answered twice” at the start)
+  let lastUserTranscriptNorm = "";
+  let lastUserTranscriptAt = 0;
+  const TRANSCRIPT_DEDUPE_MS = 1700;
+
+  // if a transcript arrives while OpenAI is mid-response, queue it once
+  let queuedTranscript = null;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -211,9 +179,29 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // prevent stuck flags
-    isAISpeaking = false;
-    responseInFlight = false;
+  }
+
+  function shouldDropDuplicateTranscript(transcript) {
+    const norm = normalizeText(transcript).replace(/\s+/g, " ").trim();
+    if (!norm) return false;
+    const now = Date.now();
+    if (norm === lastUserTranscriptNorm && (now - lastUserTranscriptAt) < TRANSCRIPT_DEDUPE_MS) {
+      return true;
+    }
+    lastUserTranscriptNorm = norm;
+    lastUserTranscriptAt = now;
+    return false;
+  }
+
+  function maybeProcessQueuedTranscript() {
+    if (!queuedTranscript) return;
+    if (isAISpeaking || responseInFlight) return;
+
+    const t = queuedTranscript;
+    queuedTranscript = null;
+
+    if (shouldDropDuplicateTranscript(t)) return;
+    injectUserTextAndRespond(t);
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -239,9 +227,9 @@ wss.on("connection", (twilioSocket) => {
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.78,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 800
+          threshold: 0.82,
+          prefix_padding_ms: 250,
+          silence_duration_ms: 450
         },
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -249,7 +237,7 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
-    // Greeting is handled in Twilio 'start' event - no duplicate greeting needed here
+    // IMPORTANT: greeting is ONLY in Twilio "start" (do not add it here)
   });
 
   openaiSocket.on("message", (raw) => {
@@ -265,27 +253,46 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Speaking flags
+    // lifecycle flags
     if (evt.type === "response.created") responseInFlight = true;
-    if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
-    if (evt.type === "response.audio.started") isAISpeaking = true;
-    if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    // Only mark pending barge-in if caller speech starts WHILE Roy is speaking
+    if (evt.type === "response.done") {
+      responseInFlight = false;
+      isAISpeaking = false;
+      maybeProcessQueuedTranscript();
+    }
+
+    if (evt.type === "response.audio.started") {
+      isAISpeaking = true;
+      aiSpeechStartedAt = Date.now();
+
+      pendingBargeIn = false;
+      bargePacketCount = 0;
+      bargeStartedAt = 0;
+      preCancelFired = false;
+    }
+
+    if (evt.type === "response.audio.done") {
+      isAISpeaking = false;
+      maybeProcessQueuedTranscript();
+    }
+
+    // mark possible barge-in only if user speech starts while Roy is talking (after grace window)
     if (evt.type === "input_audio_buffer.speech_started") {
       if (isAISpeaking || responseInFlight) {
+        if (Date.now() - aiSpeechStartedAt < BARGE_IN_GRACE_MS) return;
         pendingBargeIn = true;
         bargePacketCount = 0;
+        bargeStartedAt = Date.now();
         preCancelFired = false;
       }
     }
 
-    // Commit on speech stop so transcription completes
     if (evt.type === "input_audio_buffer.speech_stopped") {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Audio back to Twilio (unchanged)
+    // audio back to Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
@@ -296,32 +303,78 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcription -> Stop Roy IMMEDIATELY when user interrupts (main fix)
+    // transcription completed
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
-      if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
+
+      // if we pre-canceled but got nothing (noise), recover
+      if (!transcript) {
+        if (preCancelFired) {
+          pendingBargeIn = false;
+          preCancelFired = false;
+          injectUserTextAndRespond("Sorry—go ahead.");
+        } else {
+          pendingBargeIn = false;
+        }
+        return;
+      }
+
+      if (shouldDropDuplicateTranscript(transcript)) {
+        pendingBargeIn = false;
+        preCancelFired = false;
+        return;
+      }
 
       const filler = isOnlyFillerWords(transcript);
 
-      // If we already pre-canceled (Roy stopped instantly when user started speaking)
+      // If we already pre-canceled, answer what user said (unless filler)
       if (preCancelFired) {
         pendingBargeIn = false;
         preCancelFired = false;
 
-        // If it was just filler, acknowledge briefly
         if (filler) {
           injectUserTextAndRespond("Okay.");
           return;
         }
 
-        // Otherwise respond to the user's input (question or statement)
+        if (isAISpeaking || responseInFlight) {
+          queuedTranscript = transcript;
+          return;
+        }
+
         injectUserTextAndRespond(transcript);
         return;
       }
 
-      // If Roy is not talking: respond normally
+      // ✅ CHANGE YOU REQUESTED:
+      // If caller tried to interrupt while Roy was talking:
+      // STOP Roy for ANY non-filler speech (question OR statement). Only ignore pure filler.
+      if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
+        if (!filler) {
+          cancelAndClearTwilio();
+          pendingBargeIn = false;
+
+          if (isAISpeaking || responseInFlight) {
+            queuedTranscript = transcript;
+            return;
+          }
+
+          injectUserTextAndRespond(transcript);
+          return;
+        }
+
+        pendingBargeIn = false;
+        return;
+      }
+
+      // Roy not speaking: respond normally (queue if needed)
       pendingBargeIn = false;
-      preCancelFired = false;
+
+      if (isAISpeaking || responseInFlight) {
+        queuedTranscript = transcript;
+        return;
+      }
+
       injectUserTextAndRespond(transcript);
     }
   });
@@ -337,9 +390,8 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
 
-  // KEEP YOUR BASE EXACTLY
   const isCallerAudio = (track) => {
-    if (!track) return false; // reject audio without track
+    if (!track) return false;
     return track === "inbound" || track === "inbound_track";
   };
 
@@ -355,7 +407,7 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED)
+      // ✅ GREETING EXACTLY LIKE YOUR OLD MAIN CODE
       sendToOpenAI({
         type: "response.create",
         response: {
@@ -381,15 +433,16 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // ✅ NEW (MINIMAL): if caller keeps talking while Roy is speaking -> STOP Roy immediately
+      // FAST CUT (noise-proof): if user starts talking while Roy is talking, cancel early
       if (pendingBargeIn && (isAISpeaking || responseInFlight) && !preCancelFired) {
         bargePacketCount += 1;
 
-        // after enough real packets, treat as real interruption and cancel NOW
-        if (bargePacketCount >= PRE_CANCEL_PACKETS) {
+        const longEnough = bargeStartedAt && (Date.now() - bargeStartedAt) >= MIN_BARGE_MS;
+        const enoughPackets = bargePacketCount >= PRE_CANCEL_PACKETS;
+
+        if (longEnough && enoughPackets) {
           preCancelFired = true;
           cancelAndClearTwilio();
-          // wait for transcript to decide filler vs question
         }
       }
 
