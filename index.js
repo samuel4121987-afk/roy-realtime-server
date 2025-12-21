@@ -89,7 +89,7 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // Audio gate
+  // Audio gate (prevents static / silence edge cases)
   let audioReady = false;
 
   // Greeting flow
@@ -102,6 +102,9 @@ wss.on("connection", (twilioSocket) => {
 
   // Language state
   let currentLang = "en";
+
+  // Track last response id (optional, used for cancel)
+  let lastResponseId = null;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -133,6 +136,7 @@ wss.on("connection", (twilioSocket) => {
     greeted = true;
     greetRequested = false;
 
+    // This is the "previous code" greeting behavior: strict, immediate, exact sentence.
     sendToOpenAI({
       type: "response.create",
       response: {
@@ -182,6 +186,21 @@ wss.on("connection", (twilioSocket) => {
     });
   }
 
+  // If caller talks while Roy is speaking, we do a clean "barge-in":
+  // cancel any ongoing response, clear flags, then answer.
+  function bargeInAndRespond(transcript) {
+    // Try to cancel whatever the server thinks is current.
+    // (If the API ignores it, we still clear local flags so we don't deadlock.)
+    if (lastResponseId) {
+      sendToOpenAI({ type: "response.cancel", response_id: lastResponseId });
+    } else {
+      sendToOpenAI({ type: "response.cancel" });
+    }
+    responseInFlight = false;
+    isAISpeaking = false;
+    createRoyResponseFromTranscript(transcript);
+  }
+
   const openaiSocket = new WebSocket(OPENAI_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -213,7 +232,7 @@ wss.on("connection", (twilioSocket) => {
       }
     });
 
-    // Fallback: avoid silence if server doesn't echo formats
+    // Fallback: avoid “no audio ever” if session events omit audio format fields.
     setTimeout(() => {
       if (!audioReady) {
         console.log("⚠️ audioReady fallback -> true (prevent silence)");
@@ -245,17 +264,13 @@ wss.on("connection", (twilioSocket) => {
       });
 
       if (outFmt == null) {
-        console.log("⚠️ output_audio_format missing; allowing audio");
         audioReady = true;
         maybeDoGreeting();
       } else if (outFmt === "g711_ulaw") {
         audioReady = true;
-        console.log("✅ audioReady = true (μ-law confirmed)");
         maybeDoGreeting();
       } else {
         audioReady = false;
-        console.log("❌ output not μ-law -> re-applying session.update");
-
         sendToOpenAI({
           type: "session.update",
           session: {
@@ -278,15 +293,20 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // --- FIX: clear isAISpeaking on response.done as well (prevents stuck speaking flag) ---
-    if (evt.type === "response.created") responseInFlight = true;
+    // State flags (prevents the "stuck after greeting" bug)
+    if (evt.type === "response.created") {
+      responseInFlight = true;
+      if (evt.response && evt.response.id) lastResponseId = evt.response.id;
+    }
+
     if (evt.type === "response.done") {
       responseInFlight = false;
-      isAISpeaking = false; // critical: don't rely only on response.audio.done
+      isAISpeaking = false; // critical: clear speaking flag here too
+      if (evt.response && evt.response.id) lastResponseId = evt.response.id;
     }
+
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
-    // -------------------------------------------------------------------------------
 
     if (evt.type === "response.audio.delta" && evt.delta) {
       if (!audioReady) return;
@@ -311,7 +331,13 @@ wss.on("connection", (twilioSocket) => {
 
       console.log("📝 Caller said:", transcript);
 
-      if (responseInFlight || isAISpeaking) return;
+      // DO NOT ignore caller after greeting.
+      // If Roy is still talking, barge-in: cancel and respond.
+      if (responseInFlight || isAISpeaking) {
+        bargeInAndRespond(transcript);
+        return;
+      }
+
       createRoyResponseFromTranscript(transcript);
     }
   });
@@ -325,7 +351,7 @@ wss.on("connection", (twilioSocket) => {
   });
 
   function isCallerAudio(track) {
-    // Twilio often omits `media.track`. If missing, treat as inbound.
+    // Twilio may omit track; if missing, treat as inbound (caller).
     if (!track) return true;
     const t = String(track).toLowerCase();
     return t.includes("inbound");
