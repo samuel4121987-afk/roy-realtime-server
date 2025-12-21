@@ -11,17 +11,46 @@ if (!OPENAI_API_KEY) {
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-// Keep session prompt focused on behavior AFTER the greeting
 const ROY_PROMPT = `
 You are Roy, the virtual receptionist for "24/7 AI".
 
-Rules:
-- Stay strictly on-topic: only talk about 24/7 AI receptionist coverage, bookings, lead capture, onboarding, setup, pricing basics.
+Core rules:
+- Always greet immediately at call start with EXACTLY: "24/7 AI, this is Roy. How can I help you?"
+- Stay on-topic: only talk about 24/7 AI receptionist coverage, bookings, lead capture, onboarding, setup, pricing basics.
   If asked unrelated questions, redirect back to 24/7 AI.
 - English by default. Switch to Spanish ONLY if caller explicitly asks for Spanish or speaks a clear Spanish sentence.
 - Short, human answers: 1–2 sentences.
 - If asked "what does OpenAI do?", answer briefly: 24/7 AI uses a virtual assistant to answer calls and capture leads.
 `.trim();
+
+const FILLER_WORDS = new Set([
+  "uh","um","hmm","ah","er","like","you","know",
+  "aha","yes","yeah","yep","okay","ok","sure","right","uh-huh","mm-hmm","mhm","mm",
+  "si","sí","vale","bueno","claro","ya","a","ver","espera"
+]);
+
+function isOnlyFillerWords(text) {
+  if (!text) return true;
+  const t = text.trim().toLowerCase();
+  if (!t) return true;
+  const words = t.split(/\s+/).map(w => w.replace(/[.,!?;:()"]/g, ""));
+  if (words.length > 4) return false;
+  return words.every(w => FILLER_WORDS.has(w));
+}
+
+function shouldSwitchToSpanish(transcript) {
+  const t = (transcript || "").trim().toLowerCase();
+  if (!t) return false;
+  if (t.includes("español") || t.includes("en español") || t.includes("spanish")) return true;
+
+  const words = t.split(/\s+/);
+  if (words.length < 6) return false;
+
+  const markers = ["hola","buenas","qué","que","cómo","como","cuánto","cuanto","precio","reservar","cita","empresa","negocio"];
+  let hits = 0;
+  for (const m of markers) if (t.includes(m)) hits++;
+  return hits >= 2;
+}
 
 const app = express();
 app.set("trust proxy", 1);
@@ -36,11 +65,8 @@ function twimlResponse(req) {
   const wsProto = proto === "http" ? "ws" : "wss";
   const wsUrl = `${wsProto}://${host}/media-stream`;
 
-  // CRITICAL: deterministic greeting, EXACTLY as you want, BEFORE streaming starts.
-  // This eliminates the model paraphrasing the greeting.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>24/7 AI, this is Roy. How can I help you?</Say>
   <Connect>
     <Stream url="${wsUrl}" track="inbound_track"/>
   </Connect>
@@ -59,26 +85,30 @@ wss.on("connection", (twilioSocket) => {
 
   let streamSid = null;
 
-  // OpenAI connection + queue
+  // OpenAI state
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // We do NOT “gate” audio with fragile session echoes; greeting is Twilio now.
-  // We always forward audio deltas if OpenAI produces them.
-  let audioReady = true;
+  // Audio gate
+  let audioReady = false;
 
-  // AI state (we will not block user turns with these flags)
+  // Greeting flow
+  let greeted = false;
+  let greetRequested = false;
+
+  // Speaking / response state
   let isAISpeaking = false;
   let responseInFlight = false;
-  let lastResponseId = null;
 
-  // Language heuristic
+  // Language state
   let currentLang = "en";
 
-  // Twilio-side end-of-utterance detection (this is what stops post-greeting silence)
-  let lastTwilioMediaAt = 0;
-  let sawCallerMedia = false;
-  let twilioSilenceTimer = null;
+  // Track last response id
+  let lastResponseId = null;
+
+  // Turn trigger fallback (IMPORTANT): if transcription event never arrives,
+  // we still respond after speech_stopped by issuing response.create.
+  let pendingTurnTimer = null;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -95,18 +125,29 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function shouldSwitchToSpanish(transcript) {
-    const t = (transcript || "").trim().toLowerCase();
-    if (!t) return false;
-    if (t.includes("español") || t.includes("en español") || t.includes("spanish")) return true;
+  function requestGreeting() {
+    greetRequested = true;
+    maybeDoGreeting();
+  }
 
-    const words = t.split(/\s+/);
-    if (words.length < 6) return false;
+  function maybeDoGreeting() {
+    if (!greetRequested) return;
+    if (greeted) return;
+    if (!streamSid) return;
+    if (!openaiOpen) return;
+    if (!audioReady) return;
 
-    const markers = ["hola","buenas","qué","que","cómo","como","cuánto","cuanto","precio","reservar","cita","empresa","negocio"];
-    let hits = 0;
-    for (const m of markers) if (t.includes(m)) hits++;
-    return hits >= 2;
+    greeted = true;
+    greetRequested = false;
+
+    sendToOpenAI({
+      type: "response.create",
+      response: {
+        output_audio_format: "g711_ulaw",
+        instructions:
+          "Start of call. Say EXACTLY this greeting and nothing else: '24/7 AI, this is Roy. How can I help you?'"
+      }
+    });
   }
 
   function scopeInstruction() {
@@ -132,48 +173,59 @@ wss.on("connection", (twilioSocket) => {
     isAISpeaking = false;
   }
 
-  // Guaranteed “caller spoke -> Roy responds”
-  function commitAndRespond() {
+  // This is the KEY: always trigger a reply turn based on conversation context.
+  // Even if transcription events are flaky, the user's utterance still exists in the conversation after commit.
+  function forceAssistantTurn() {
+    if (!greeted) return;
     if (!openaiOpen) return;
+    if (!audioReady) return;
 
-    // If caller talks while Roy speaks, barge-in: cancel then respond.
-    if (responseInFlight || isAISpeaking) cancelAnyOngoingResponse();
+    // Only cancel if ACTIVELY in flight - don't cancel if already done
+    if (responseInFlight) {
+      cancelAnyOngoingResponse();
+    }
 
-    // Commit buffered audio into a user turn
-    sendToOpenAI({ type: "input_audio_buffer.commit" });
-
-    // Create response from that committed audio turn
     sendToOpenAI({
       type: "response.create",
       response: {
-        modalities: ["audio"],
         output_audio_format: "g711_ulaw",
         instructions: scopeInstruction()
       }
     });
-
-    // Clear buffer to avoid “stale audio” issues
-    sendToOpenAI({ type: "input_audio_buffer.clear" });
   }
 
-  function armTwilioSilenceTimer() {
-    if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer);
+  // If we DO have the transcript, we can do filler + language switching more intelligently.
+  function createRoyResponseFromTranscript(transcriptRaw) {
+    const transcript = (transcriptRaw || "").trim();
+    if (!transcript) {
+      // No transcript? Still respond (don’t go silent).
+      forceAssistantTurn();
+      return;
+    }
 
-    // “Silence” threshold after caller audio (tune 650–1200 if you want)
-    twilioSilenceTimer = setTimeout(() => {
-      const now = Date.now();
-      const idleMs = now - lastTwilioMediaAt;
+    if (currentLang === "en" && shouldSwitchToSpanish(transcript)) currentLang = "es";
 
-      if (sawCallerMedia && idleMs >= 700) {
-        sawCallerMedia = false;
-        commitAndRespond();
-      } else {
-        armTwilioSilenceTimer();
-      }
-    }, 750);
+    const filler = isOnlyFillerWords(transcript);
+
+    if (filler) {
+      cancelAnyOngoingResponse();
+      sendToOpenAI({
+        type: "response.create",
+        response: {
+          output_audio_format: "g711_ulaw",
+          instructions:
+            currentLang === "es"
+              ? `Responde SOLO sobre 24/7 AI. El usuario dijo una muletilla. Responde muy breve: 'Vale' o 'Entendido' y espera.`
+              : `Answer ONLY about 24/7 AI. Caller said a filler word. Reply very briefly: 'Okay' or 'Got it' and wait.`
+        }
+      });
+      return;
+    }
+
+    // Normal: let the model respond to the last user turn; instructions enforce scope.
+    forceAssistantTurn();
   }
 
-  // OpenAI WS
   const openaiSocket = new WebSocket(OPENAI_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -194,12 +246,25 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo",
         temperature: 0.4,
         instructions: ROY_PROMPT,
-        // We DO NOT rely on server_vad anymore for turns; Twilio silence timer triggers turns.
-        turn_detection: { type: "server_vad", threshold: 0.7, prefix_padding_ms: 300, silence_duration_ms: 900 },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.85,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 900
+        },
         max_response_output_tokens: 180,
         input_audio_transcription: { model: "whisper-1" }
       }
     });
+
+    // Fallback: avoid permanent silence if session events omit formats
+    setTimeout(() => {
+      if (!audioReady) {
+        console.log("⚠️ audioReady fallback -> true (prevent silence)");
+        audioReady = true;
+        maybeDoGreeting();
+      }
+    }, 1200);
 
     flushOpenAIQueue();
   });
@@ -212,16 +277,35 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Track response state (only for barge-in cancel; we NEVER block caller turns)
+    // Session confirmation
+    if (evt.type === "session.created" || evt.type === "session.updated") {
+      const s = evt.session || {};
+      const outFmt = s.output_audio_format;
+      const inFmt = s.input_audio_format;
+
+      console.log("🧾 session.* received:", {
+        input_audio_format: inFmt,
+        output_audio_format: outFmt,
+        voice: s.voice
+      });
+
+      // Always set audioReady = true when we get session confirmation
+      audioReady = true;
+      maybeDoGreeting();
+    }
+
+    // State flags (DO NOT DEADLOCK)
     if (evt.type === "response.created") {
       responseInFlight = true;
       if (evt.response && evt.response.id) lastResponseId = evt.response.id;
     }
+
     if (evt.type === "response.done") {
       responseInFlight = false;
-      isAISpeaking = false;
+      isAISpeaking = false; // critical: clear here too
       if (evt.response && evt.response.id) lastResponseId = evt.response.id;
     }
+
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
 
@@ -239,14 +323,37 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // If transcription comes, we can switch language intelligently (optional)
+    // When the caller stops speaking: commit audio, then FORCE a response turn.
+    // This is what fixes "Roy says greeting then never speaks again".
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      sendToOpenAI({ type: "input_audio_buffer.commit" });
+
+      // Debounce: wait a beat for transcription event; if it doesn't arrive, respond anyway.
+      if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
+      pendingTurnTimer = setTimeout(() => {
+        forceAssistantTurn();
+      }, 250);
+    }
+
+    // If transcription DOES arrive, use it (better language switching / filler handling),
+    // and cancel the fallback timer so we don’t double-respond.
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) return;
 
       console.log("📝 Caller said:", transcript);
 
-      if (currentLang === "en" && shouldSwitchToSpanish(transcript)) currentLang = "es";
+      if (pendingTurnTimer) {
+        clearTimeout(pendingTurnTimer);
+        pendingTurnTimer = null;
+      }
+
+      // Only cancel if ACTIVELY in flight - don't cancel if already done
+      if (responseInFlight) {
+        cancelAnyOngoingResponse();
+      }
+
+      createRoyResponseFromTranscript(transcript);
     }
   });
 
@@ -267,7 +374,6 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
 
-  // Twilio WS inbound
   twilioSocket.on("message", (msg) => {
     let data;
     try {
@@ -279,10 +385,7 @@ wss.on("connection", (twilioSocket) => {
     if (data.event === "start") {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("🟢 Twilio start:", streamSid);
-
-      lastTwilioMediaAt = Date.now();
-      sawCallerMedia = false;
-      armTwilioSilenceTimer();
+      requestGreeting();
       return;
     }
 
@@ -292,39 +395,48 @@ wss.on("connection", (twilioSocket) => {
         trackLogged = true;
         console.log("📞 Twilio media.track =", track || "(missing)");
       }
+
       if (!isCallerAudio(track)) return;
 
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Mark caller audio + update silence detection
-      lastTwilioMediaAt = Date.now();
-      sawCallerMedia = true;
-      armTwilioSilenceTimer();
-
-      // Send caller audio to OpenAI
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
 
     if (data.event === "stop") {
       console.log("🔴 Twilio stop");
-      try { if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer); } catch {}
-      try { if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close(); } catch {}
-      try { if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close(); } catch {}
+      try {
+        if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
+      } catch {}
+      try {
+        if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
+      } catch {}
+      try {
+        if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
+      } catch {}
     }
   });
 
   twilioSocket.on("close", () => {
     console.log("🔴 Twilio WS closed");
-    try { if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer); } catch {}
-    try { if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close(); } catch {}
+    try {
+      if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
+    } catch {}
+    try {
+      if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
+    } catch {}
   });
 
   twilioSocket.on("error", (e) => {
     console.error("❌ Twilio WS error", e);
-    try { if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer); } catch {}
-    try { if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close(); } catch {}
+    try {
+      if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
+    } catch {}
+    try {
+      if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
+    } catch {}
   });
 });
 
