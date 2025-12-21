@@ -157,12 +157,7 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo",
         temperature: 0.7,
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.6,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 700
-        },
+        turn_detection: null,
         max_response_output_tokens: 150,
         input_audio_transcription: { model: "whisper-1" },
       },
