@@ -19,7 +19,7 @@ You are Roy, the receptionist for the company "24/7 AI".
 ## Immediate Greeting (EXACT)
 - At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble):
 "24/7 AI, this is Roy. How can I help you?"
-- After the greeting, STOP and WAIT silently for the caller to speak. Do NOT continue talking.
+- Never repeat the greeting.
 
 ## Tone and Style
 - Natural, friendly, confident, human.
@@ -167,7 +167,7 @@ function isEchoOfAssistant(transcript, lastAssistantText) {
   return false;
 }
 
-/** ---------------- Near-duplicate user dedupe ---------------- **/
+/** ---------------- Near-duplicate user dedupe (semantic-ish) ---------------- **/
 
 const STOPWORDS = new Set([
   "i","im","i'm","am","are","is","was","were","be","been","being",
@@ -212,22 +212,6 @@ function isNearDuplicateUserTranscript(curr, lastRaw, lastAtMs, nowMs) {
   if (cW.length === 0 && lW.length === 0) return true;
 
   return overlapSimilarity(cW, lW) >= 0.65;
-}
-
-/** ---------------- NEW: “wait for caller” gate after greeting ---------------- **/
-
-function isMeaningfulFirstUtterance(transcript) {
-  const t = (transcript || "").trim();
-  if (!t) return false;
-
-  // Don’t react to tiny/noise fragments right after greeting
-  const norm = normalizeText(t);
-  if (norm.length < 6) return false;
-
-  // Filler-only should not trigger a sales pitch
-  if (isOnlyFillerWords(t)) return false;
-
-  return true;
 }
 
 /** ---------------------------------------------------------------------- **/
@@ -275,10 +259,8 @@ wss.on("connection", (twilioSocket) => {
   let lastUserRaw = "";
   let lastUserAtMs = 0;
 
-  // NEW: greeting state + “wait for caller”
-  let greetingSent = false;
-  let greetingDone = false;
-  let waitingForFirstUser = true;
+  // ✅ Greeting state (prevents “no greeting” + prevents double greeting)
+  let greeted = false;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -316,21 +298,20 @@ wss.on("connection", (twilioSocket) => {
     responseInFlight = false;
   }
 
-  function sendGreetingOnce() {
-    if (!streamSid || !openaiOpen || greetingSent) return;
-    greetingSent = true;
-    waitingForFirstUser = true;
+  function requestGreetingOnce() {
+    if (greeted) return;
+    greeted = true;
 
-    // HARD: single sentence + stop
+    // Strong “exact greeting only”
     sendToOpenAI({
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
         temperature: 0,
         max_response_output_tokens: 60,
-        instructions: `Say EXACTLY: "${GREETING_TEXT}" Then STOP and WAIT silently. Do not add anything else.`,
-        commit: true
-      }
+        instructions: `Say EXACTLY: "${GREETING_TEXT}" Then STOP.`,
+        commit: true,
+      },
     });
   }
 
@@ -354,7 +335,6 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-        // keep responses tight by default
         max_response_output_tokens: 180,
         turn_detection: {
           type: "server_vad",
@@ -368,8 +348,8 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
-    // IMPORTANT: do NOT auto-greet here anymore.
-    // Greeting is triggered ONLY from Twilio "start" to prevent extra initial turns.
+    // ✅ If Twilio start already happened, greet now (older behavior that WORKS)
+    if (streamSid) requestGreetingOnce();
   });
 
   openaiSocket.on("message", (raw) => {
@@ -387,11 +367,6 @@ wss.on("connection", (twilioSocket) => {
 
     if (evt.type === "response.text.done" && typeof evt.text === "string") {
       lastAssistantText = evt.text;
-
-      // Mark greeting completion when we see it
-      if (normalizeText(evt.text).includes(normalizeText(GREETING_TEXT))) {
-        greetingDone = true;
-      }
     }
 
     if (evt.type === "response.created") responseInFlight = true;
@@ -427,7 +402,7 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
-      // Drop near-duplicates
+      // Drop near-duplicates (prevents “answers twice”)
       const nowMs = Date.now();
       if (isNearDuplicateUserTranscript(transcript, lastUserRaw, lastUserAtMs, nowMs)) {
         pendingBargeIn = false;
@@ -436,29 +411,11 @@ wss.on("connection", (twilioSocket) => {
       lastUserRaw = transcript;
       lastUserAtMs = nowMs;
 
-      // NEW: After greeting, wait for a meaningful first user utterance.
-      // This prevents Roy from jumping into a pitch off noise / tiny fragments.
-      if (waitingForFirstUser) {
-        // Don’t start conversation until greeting is done (safety)
-        if (!greetingDone && greetingSent) {
-          pendingBargeIn = false;
-          return;
-        }
-
-        if (!isMeaningfulFirstUtterance(transcript)) {
-          pendingBargeIn = false;
-          return;
-        }
-
-        // Caller actually spoke meaningfully
-        waitingForFirstUser = false;
-      }
-
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
       const aiCurrentlyTalking = (isAISpeaking || responseInFlight);
 
-      // If Roy is talking and caller asked a real question, cancel immediately
+      // ✅ If Roy is talking and caller asked a real question, cancel immediately
       if (aiCurrentlyTalking && !filler && strongQ) {
         cancelAndClearTwilio();
         pendingBargeIn = false;
@@ -505,8 +462,8 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Trigger greeting ONLY here
-      sendGreetingOnce();
+      // ✅ Greet immediately (queued if OpenAI not open yet) — older behavior
+      requestGreetingOnce();
       return;
     }
 
