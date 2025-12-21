@@ -52,47 +52,27 @@ Always follow these instructions for every call without exception.
 
 // Expanded filler words list including Spanish
 const FILLER_WORDS = [
-  "uh","um","hmm","ah","er","like","you","know",
-  "aha","yes","yeah","yep","okay","ok","sure","right",
-  "si","sí","vale","bueno","claro","uh-huh","mm-hmm","mhm",
-  "yup","mm","no","wait","hold","on","what","huh",
-  "qué","espera","a","ver","ya"
+  'uh', 'um', 'hmm', 'ah', 'er', 'like', 'you know',
+  'aha', 'yes', 'yeah', 'yep', 'okay', 'ok', 'sure', 'right',
+  'si', 'vale', 'bueno', 'claro', 'uh-huh', 'mm-hmm', 'mhm',
+  'yup', 'mm', 'no', 'wait', 'hold on', 'what', 'huh',
+  'qué', 'espera', 'a ver', 'vale sí', 'ya', 'okay yeah'
 ];
 
 // Function to check if text is just filler words
 function isOnlyFillerWords(text) {
   if (!text || text.trim().length === 0) return true;
-
+  
   const words = text.toLowerCase().trim().split(/\s+/);
-
+  
   // If more than 3 words, it's likely a real sentence
   if (words.length > 3) return false;
-
+  
   // Check if all words are filler words
-  return words.every((word) => {
-    const cleanWord = word.replace(/[.,!?;:()"]/g, "");
+  return words.every(word => {
+    const cleanWord = word.replace(/[.,!?;:]/g, '');
     return FILLER_WORDS.includes(cleanWord);
   });
-}
-
-// Stronger “real speech” check for barge-in confirmation
-function looksLikeRealSpeech(transcript) {
-  const t = (transcript || "").trim();
-  if (!t) return false;
-
-  const lower = t.toLowerCase();
-  // If it's just filler, not real speech
-  if (isOnlyFillerWords(lower)) return false;
-
-  // Reject tiny garbage like "a", "hm", single char, etc.
-  const alphaNum = lower.replace(/[^a-z0-9áéíóúñü\s]/gi, "").trim();
-  if (alphaNum.length < 5) return false;
-
-  // If only 1 short word (common in echo), reject
-  const words = alphaNum.split(/\s+/).filter(Boolean);
-  if (words.length === 1 && words[0].length < 6) return false;
-
-  return true;
 }
 
 const app = express();
@@ -132,43 +112,31 @@ wss.on("connection", (twilioSocket) => {
   const openaiQueue = [];
   let latestMediaTimestamp = 0;
   let isAISpeaking = false;
-  let lastUserTranscript = "";
+  let lastUserTranscript = '';
   let greeted = false;
-
+  
   // Debounced barge-in to avoid false triggers from noise
   let bargeTimer = null;
   let pendingBargeIn = false;
-
-  // Make barge-in detection less twitchy
-  const BARGE_IN_DEBOUNCE_MS = 220;
+  const BARGE_IN_DEBOUNCE_MS = 160;
   let cancelCooldownUntil = 0;
-  const CANCEL_COOLDOWN_MS = 450;
-
-  // IMPORTANT CHANGE:
-  // Stop using base64-to-bytes guessing. Count inbound packets while pendingBargeIn.
-  // Twilio media frames are ~20ms each for g711_ulaw.
-  let inboundPacketCounter = 0;
-
-  // Require ~400ms+ of inbound audio before we even consider canceling
-  const MIN_BARGE_PACKETS = 20; // 20 * 20ms = ~400ms
-
-  // Also require the “speech_started -> transcript” window to be long enough (echo is often very short)
-  let pendingBargeInStartedAt = 0;
-  const MIN_BARGE_DURATION_MS = 350;
-
+  const CANCEL_COOLDOWN_MS = 350;
+  
+  // Minimum inbound audio gate to prevent false cancels from echo/noise
+  let inboundAudioCounter = 0;
+  const MIN_INBOUND_AUDIO_THRESHOLD = 4000; // ~500ms of real decoded audio (increased from 2000)
+  
   // Grace window to prevent echo cancels right after Roy starts speaking
   let aiSpeechStartedAt = 0;
-
-  // IMPORTANT CHANGE: longer grace window
-  const BARGE_IN_GRACE_MS = 1100;
-
+  const BARGE_IN_GRACE_MS = 800; // Increased from 450 to 800ms
+  
   // Prevent overlapping responses
   let responseInFlight = false;
 
-  // Queue transcript if it arrives while Roy is still speaking
+  // NEW: queue transcript if it arrives while Roy is still speaking
   let queuedTranscript = null;
-
-  // Block new responses during cancel flush
+  
+  // NEW: block new responses during cancel flush
   let cancelInProgress = false;
 
   function sendToOpenAI(obj) {
@@ -200,31 +168,23 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({
         type: "response.create",
         response: {
-          output_audio_format: "g711_ulaw",
-          instructions:
-            "Caller utterance was a brief acknowledgment like 'yeah' or 'okay'. Reply very briefly (just 'Got it' or 'Okay') and continue the prior topic with ONE new sentence."
+          instructions: "Caller utterance was a brief acknowledgment like 'yeah' or 'okay'. Reply very briefly (just 'Got it' or 'Okay') and continue the prior topic with ONE new sentence."
         }
       });
     } else {
       sendToOpenAI({
         type: "response.create",
         response: {
-          output_audio_format: "g711_ulaw",
-          instructions:
-            "Caller utterance is a real message or question. Answer directly and briefly (1–2 sentences). If unclear, ask one short clarification question."
+          instructions: "Caller utterance is a real message or question. Answer directly and briefly (1–2 sentences). If unclear, ask one short clarification question."
         }
       });
     }
   }
-
+  
   function requestCancelAndFlush() {
     cancelInProgress = true;
     sendToOpenAI({ type: "response.cancel" });
-
-    if (streamSid && twilioSocket.readyState === WebSocket.OPEN) {
-      twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
-    }
-
+    twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     cancelCooldownUntil = Date.now() + CANCEL_COOLDOWN_MS;
     // Do NOT set isAISpeaking=false here; let audio.done / response.done settle it
   }
@@ -240,7 +200,8 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // IMPORTANT CHANGE: less sensitive VAD threshold to reduce echo false-positives
+    // Configure session with server VAD for speech detection
+    // BUT we use transcript-based confirmation before canceling (prevents echo false-positives)
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -252,7 +213,7 @@ wss.on("connection", (twilioSocket) => {
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.82,          // was 0.65 (too sensitive)
+          threshold: 0.75, // Increased from 0.65 to reduce false positives
           prefix_padding_ms: 300,
           silence_duration_ms: 800
         },
@@ -269,9 +230,7 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({
         type: "response.create",
         response: {
-          output_audio_format: "g711_ulaw",
-          instructions:
-            "This is the start of the call. Greet immediately with exactly: '24/7 AI, this is Roy. How can I help you?'"
+          instructions: "This is the start of the call. Greet immediately with exactly: '24/7 AI, this is Roy. How can I help you?'"
         }
       });
     }
@@ -288,19 +247,22 @@ wss.on("connection", (twilioSocket) => {
     // Speech started: mark possible barge-in (don't cancel yet)
     if (evt.type === "input_audio_buffer.speech_started") {
       if (!isAISpeaking) return;
+      
       if (Date.now() < cancelCooldownUntil) return;
-      if (Date.now() - aiSpeechStartedAt < BARGE_IN_GRACE_MS) return;
-
+      
+      if (Date.now() - aiSpeechStartedAt < BARGE_IN_GRACE_MS) {
+        return;
+      }
+      
       pendingBargeIn = true;
-      inboundPacketCounter = 0;
-      pendingBargeInStartedAt = Date.now();
-
+      inboundAudioCounter = 0;
+      
       if (bargeTimer) clearTimeout(bargeTimer);
       bargeTimer = setTimeout(() => {
         // Transcript will decide.
       }, BARGE_IN_DEBOUNCE_MS);
     }
-
+    
     // Speech stopped: commit buffer (keep pendingBargeIn until transcript)
     if (evt.type === "input_audio_buffer.speech_stopped") {
       if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = null; }
@@ -325,18 +287,20 @@ wss.on("connection", (twilioSocket) => {
         safeCreateResponseFromTranscript(t);
       }
     }
-
+    
     // Response lifecycle
     if (evt.type === "response.created") responseInFlight = true;
-
+    
     if (evt.type === "response.done") {
       responseInFlight = false;
-
+      
+      // If we canceled, the cancel "flush" is now complete
       if (cancelInProgress) {
         cancelInProgress = false;
         console.log("✅ Cancel flush complete (response.done)");
       }
-
+      
+      // If something was queued, handle it now (safe point)
       if (queuedTranscript && !isAISpeaking && !responseInFlight && !cancelInProgress) {
         const t = queuedTranscript;
         queuedTranscript = null;
@@ -349,15 +313,15 @@ wss.on("connection", (twilioSocket) => {
       (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
       evt.delta
     ) {
+      // IMPORTANT: do NOT flip isAISpeaking=true here; rely on response.audio.started
+      // Also ignore deltas while cancel is flushing (these are stale frames)
       if (cancelInProgress) return;
-
-      if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
-        twilioSocket.send(JSON.stringify({
-          event: "media",
-          streamSid: streamSid,
-          media: { payload: evt.delta }
-        }));
-      }
+      
+      twilioSocket.send(JSON.stringify({
+        event: "media",
+        streamSid: streamSid,
+        media: { payload: evt.delta }
+      }));
     }
 
     // Transcription completed
@@ -365,35 +329,24 @@ wss.on("connection", (twilioSocket) => {
       const transcript = (evt.transcript || "").trim();
       console.log(`👤 User said: "${transcript}"`);
 
-      // If barge-in was detected while Roy spoke, confirm here (HARDENED)
+      // If barge-in was detected while Roy spoke, confirm here
       if (pendingBargeIn) {
-        const durationMs = Date.now() - pendingBargeInStartedAt;
+        const filler = isOnlyFillerWords(transcript);
 
-        const realSpeech = looksLikeRealSpeech(transcript);
-        const enoughPackets = inboundPacketCounter >= MIN_BARGE_PACKETS;
-        const enoughDuration = durationMs >= MIN_BARGE_DURATION_MS;
-
-        // Only cancel if ALL of these are true:
-        // 1) transcript looks real (not empty/garbage/filler)
-        // 2) caller audio lasted long enough (packets + duration)
-        if (realSpeech && enoughPackets && enoughDuration) {
-          console.log(
-            `🛑 Confirmed barge-in: packets=${inboundPacketCounter}, duration=${durationMs}ms, transcript="${transcript}"`
-          );
-
+        if (!filler && inboundAudioCounter >= MIN_INBOUND_AUDIO_THRESHOLD) {
+          console.log(`🛑 Confirmed barge-in: "${transcript}" -> cancel now`);
           requestCancelAndFlush();
+
+          // Queue the transcript to respond AFTER cancel flush completes
           queuedTranscript = transcript;
 
           pendingBargeIn = false;
-          inboundPacketCounter = 0;
-          pendingBargeInStartedAt = 0;
+          inboundAudioCounter = 0;
           return; // CRITICAL: do NOT create response now
         }
 
-        // Not strong enough evidence -> ignore as echo/noise
         pendingBargeIn = false;
-        inboundPacketCounter = 0;
-        pendingBargeInStartedAt = 0;
+        inboundAudioCounter = 0;
       }
 
       // Normal path: respond safely (or queue if speaking/inflight/canceling)
@@ -408,6 +361,7 @@ wss.on("connection", (twilioSocket) => {
   openaiSocket.on("close", (c, r) => {
     console.error("❌ OpenAI WS closed", c, r ? r.toString() : "");
     // Do NOT close the Twilio socket here. Keep the call alive.
+    // In production, you could play a fallback TTS message here.
   });
 
   openaiSocket.on("error", (e) => {
@@ -416,8 +370,7 @@ wss.on("connection", (twilioSocket) => {
 
   // Helper function to check if audio is from caller
   const isCallerAudio = (track) => {
-    // IMPORTANT: Twilio often omits media.track; treat missing as inbound
-    if (!track) return true;
+    if (!track) return false;
     return track === "inbound" || track === "inbound_track";
   };
 
@@ -441,9 +394,7 @@ wss.on("connection", (twilioSocket) => {
         sendToOpenAI({
           type: "response.create",
           response: {
-            output_audio_format: "g711_ulaw",
-            instructions:
-              "This is the start of the call. Greet immediately with exactly: '24/7 AI, this is Roy. How can I help you?'"
+            instructions: "This is the start of the call. Greet immediately with exactly: '24/7 AI, this is Roy. How can I help you?'"
           }
         });
       }
@@ -460,16 +411,15 @@ wss.on("connection", (twilioSocket) => {
       // Prevent feedback loop: only caller audio
       if (!isCallerAudio(track)) return;
 
-      latestMediaTimestamp = data.media && data.media.timestamp
-        ? data.media.timestamp
-        : latestMediaTimestamp;
+      latestMediaTimestamp = data.media && data.media.timestamp ? data.media.timestamp : latestMediaTimestamp;
 
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Packet counting is reliable; Twilio sends ~20ms per media frame
+      // Track inbound audio for minimum audio gate (prevents false barge-in from echo/noise)
+      // Convert base64 length to decoded bytes (base64 is ~4/3 larger than raw)
       if (pendingBargeIn) {
-        inboundPacketCounter += 1;
+        inboundAudioCounter += Math.floor((payload.length * 3) / 4);
       }
 
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
