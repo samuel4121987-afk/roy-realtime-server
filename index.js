@@ -106,31 +106,9 @@ wss.on("connection", (twilioSocket) => {
   // Track last response id
   let lastResponseId = null;
 
-  // --------- CRITICAL: Twilio-side turn detection (works even if OpenAI VAD/transcription is flaky) ---------
-  let lastTwilioMediaAt = 0;
-  let twilioMediaSinceLastCommit = false;
-  let twilioSilenceTimer = null;
-
-  function armTwilioSilenceTimer() {
-    if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer);
-    twilioSilenceTimer = setTimeout(() => {
-      const now = Date.now();
-      const idleMs = now - lastTwilioMediaAt;
-
-      // If we saw caller media, and now we've had "silence", commit + force response.
-      if (twilioMediaSinceLastCommit && idleMs >= 650) {
-        twilioMediaSinceLastCommit = false;
-
-        // Commit whatever is in the buffer and force a response turn.
-        sendToOpenAI({ type: "input_audio_buffer.commit" });
-        forceAssistantTurn();
-      } else {
-        // Keep checking
-        armTwilioSilenceTimer();
-      }
-    }, 700);
-  }
-  // --------------------------------------------------------------------------------------------------------
+  // Turn trigger fallback (IMPORTANT): if transcription event never arrives,
+  // we still respond after speech_stopped by issuing response.create.
+  let pendingTurnTimer = null;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -195,12 +173,14 @@ wss.on("connection", (twilioSocket) => {
     isAISpeaking = false;
   }
 
-  // This guarantees Roy responds after the caller speaks (even if transcription never fires)
+  // This is the KEY: always trigger a reply turn based on conversation context.
+  // Even if transcription events are flaky, the user's utterance still exists in the conversation after commit.
   function forceAssistantTurn() {
     if (!greeted) return;
     if (!openaiOpen) return;
     if (!audioReady) return;
 
+    // If Roy is still speaking, barge-in cleanly.
     if (responseInFlight || isAISpeaking) cancelAnyOngoingResponse();
 
     sendToOpenAI({
@@ -212,9 +192,11 @@ wss.on("connection", (twilioSocket) => {
     });
   }
 
+  // If we DO have the transcript, we can do filler + language switching more intelligently.
   function createRoyResponseFromTranscript(transcriptRaw) {
     const transcript = (transcriptRaw || "").trim();
     if (!transcript) {
+      // No transcript? Still respond (don’t go silent).
       forceAssistantTurn();
       return;
     }
@@ -238,6 +220,7 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
+    // Normal: let the model respond to the last user turn; instructions enforce scope.
     forceAssistantTurn();
   }
 
@@ -261,10 +244,9 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo",
         temperature: 0.4,
         instructions: ROY_PROMPT,
-        // Keep server_vad on, but we DO NOT depend on it anymore.
         turn_detection: {
           type: "server_vad",
-          threshold: 0.7,
+          threshold: 0.85,
           prefix_padding_ms: 300,
           silence_duration_ms: 900
         },
@@ -293,38 +275,24 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
+    // Session confirmation
     if (evt.type === "session.created" || evt.type === "session.updated") {
       const s = evt.session || {};
       const outFmt = s.output_audio_format;
+      const inFmt = s.input_audio_format;
 
-      if (outFmt == null || outFmt === "g711_ulaw") {
-        audioReady = true;
-        maybeDoGreeting();
-      } else {
-        audioReady = false;
-        sendToOpenAI({
-          type: "session.update",
-          session: {
-            modalities: ["text", "audio"],
-            input_audio_format: "g711_ulaw",
-            output_audio_format: "g711_ulaw",
-            voice: "echo",
-            temperature: 0.4,
-            instructions: ROY_PROMPT,
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.7,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 900
-            },
-            max_response_output_tokens: 180,
-            input_audio_transcription: { model: "whisper-1" }
-          }
-        });
-      }
+      console.log("🧾 session.* received:", {
+        input_audio_format: inFmt,
+        output_audio_format: outFmt,
+        voice: s.voice
+      });
+
+      // Always set audioReady = true when we get session confirmation
+      audioReady = true;
+      maybeDoGreeting();
     }
 
-    // State flags (cannot deadlock)
+    // State flags (DO NOT DEADLOCK)
     if (evt.type === "response.created") {
       responseInFlight = true;
       if (evt.response && evt.response.id) lastResponseId = evt.response.id;
@@ -332,7 +300,7 @@ wss.on("connection", (twilioSocket) => {
 
     if (evt.type === "response.done") {
       responseInFlight = false;
-      isAISpeaking = false;
+      isAISpeaking = false; // critical: clear here too
       if (evt.response && evt.response.id) lastResponseId = evt.response.id;
     }
 
@@ -353,14 +321,34 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // If transcription arrives, use it (but we do NOT rely on it)
+    // When the caller stops speaking: commit audio, then FORCE a response turn.
+    // This is what fixes "Roy says greeting then never speaks again".
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      sendToOpenAI({ type: "input_audio_buffer.commit" });
+
+      // Debounce: wait a beat for transcription event; if it doesn't arrive, respond anyway.
+      if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
+      pendingTurnTimer = setTimeout(() => {
+        forceAssistantTurn();
+      }, 250);
+    }
+
+    // If transcription DOES arrive, use it (better language switching / filler handling),
+    // and cancel the fallback timer so we don’t double-respond.
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) return;
 
       console.log("📝 Caller said:", transcript);
 
+      if (pendingTurnTimer) {
+        clearTimeout(pendingTurnTimer);
+        pendingTurnTimer = null;
+      }
+
+      // If Roy is mid-speech, barge-in instead of ignoring the user.
       if (responseInFlight || isAISpeaking) cancelAnyOngoingResponse();
+
       createRoyResponseFromTranscript(transcript);
     }
   });
@@ -394,12 +382,6 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("🟢 Twilio start:", streamSid);
       requestGreeting();
-
-      // Start the Twilio-side silence timer (so we can detect end-of-utterance ourselves)
-      lastTwilioMediaAt = Date.now();
-      twilioMediaSinceLastCommit = false;
-      armTwilioSilenceTimer();
-
       return;
     }
 
@@ -409,17 +391,12 @@ wss.on("connection", (twilioSocket) => {
         trackLogged = true;
         console.log("📞 Twilio media.track =", track || "(missing)");
       }
+
       if (!isCallerAudio(track)) return;
 
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Mark that we got caller audio, and keep updating last time
-      lastTwilioMediaAt = Date.now();
-      twilioMediaSinceLastCommit = true;
-      armTwilioSilenceTimer();
-
-      // Feed to OpenAI
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
@@ -427,7 +404,7 @@ wss.on("connection", (twilioSocket) => {
     if (data.event === "stop") {
       console.log("🔴 Twilio stop");
       try {
-        if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer);
+        if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
       } catch {}
       try {
         if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
@@ -441,7 +418,7 @@ wss.on("connection", (twilioSocket) => {
   twilioSocket.on("close", () => {
     console.log("🔴 Twilio WS closed");
     try {
-      if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer);
+      if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
     } catch {}
     try {
       if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
@@ -451,7 +428,7 @@ wss.on("connection", (twilioSocket) => {
   twilioSocket.on("error", (e) => {
     console.error("❌ Twilio WS error", e);
     try {
-      if (twilioSilenceTimer) clearTimeout(twilioSilenceTimer);
+      if (pendingTurnTimer) clearTimeout(pendingTurnTimer);
     } catch {}
     try {
       if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
