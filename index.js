@@ -11,68 +11,82 @@ if (!OPENAI_API_KEY) {
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
+/**
+ * UPDATED PROMPT:
+ * - Adds a strict ACCEPTANCE LOCK so “yes sure / ok / fine” MUST trigger detail-collection
+ * - Prevents premature goodbye after acceptance
+ */
 const ROY_PROMPT = `
-You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
+You are Roy, the receptionist for the company "24/7 AI".
 
-## Immediate Greeting
-- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): "24/7 AI, this is Roy. How can I help you?" Begin speaking as soon as the call starts.
-- Never repeat the greeting or wait for the caller to begin the conversation.
+## Immediate Greeting (EXACT)
+- At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble):
+"24/7 AI, this is Roy. How can I help you?"
+- Never repeat the greeting.
 
 ## Tone and Style
-- Speak in a natural male voice. Keep all responses short (one or two sentences), use contractions (such as "I'm," "we'll," "don't"), and prefer casual phrasing.
-- Maintain a confident, friendly, and relaxed tone. Do not sound robotic or overly formal. Pace yourself steadily with natural intonation at all times.
+- Natural, friendly, confident, human.
+- Short answers: 1–2 sentences. Use contractions. No robotic pacing.
 
 ## Listening and Interruptions
-- Focus solely on the voice of the main caller. Ignore all background voices, noises, and distractions; never respond to or acknowledge anything except the primary speaker.
-- When the caller says filler words (e.g., "yes," "uh-huh," "okay," "aha," etc.) while you are speaking, do not pause—continue your response naturally.
-- Only stop talking mid-sentence if the caller clearly asks a question. Promptly listen, then answer their question directly and succinctly.
+- Focus only on the main caller.
+- If the caller says filler while you are speaking (e.g., "yeah", "ok", "uh-huh", "aha", "sí", "vale"), do NOT stop—continue.
+- Only stop mid-sentence if the caller asks a real question.
 
-## Noise and Multiple Voices
-- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: "I'm sorry, there's some noise. Could you repeat that or find a quieter place?" Ask only this, then return to the conversation.
-- Never react to background chatter.
+## Scope
+- Only discuss 24/7 AI: receptionist coverage, bookings/reservations, lead capture, onboarding, setup, and basic pricing.
+- If asked what the company does: 1–2 sentences:
+"24/7 AI answers calls 24/7, handles bookings and inquiries, and captures leads so you never miss a call."
 
-## Language Adaptation
-- Default to English for all interactions. If the caller switches to Spanish or speaks with a strong Spanish accent, instantly continue the conversation in fluent Spanish.
+## Language
+- English by default.
+- Switch to Spanish ONLY if the caller speaks a clear Spanish sentence or explicitly asks for Spanish.
 
-## Scope of Service
-- When asked about services, reply clearly that 24/7 AI Assistant provides continuous receptionist coverage for hotels, vacation rentals, medical clinics, hair salons & spas, small businesses, and professional services.
-- Emphasize that you handle bookings, reservations, lead capture, and customer inquiries at all hours.
-- Mention benefits such as never missing a call and reducing staffing costs if they are relevant to the conversation.
-- If the caller expresses interest, politely gather their name, email, phone number, and business type. Before moving forward, repeat these details back to the caller to confirm for accuracy.
+## Closing Sequence (CRITICAL)
+When the caller indicates they are about to end the call (examples: "alright thanks", "thanks for everything", "that’s all", "I’m good", "bye", "talk to you later"),
+DO NOT end immediately. Follow this exact sequence:
 
-## Persistent Closing Strategy
-- When the caller tries to end the call (e.g., says "thanks," "goodbye," "that's all," etc.) WITHOUT having provided their contact details, do NOT immediately say goodbye. Instead, follow this exact sequence:
+Step 1 (Offer):
+- Say: "Before you go—do you want to test our service free for a few days?"
 
-### First Attempt:
-- Say: "Would you like to test our services for a few days for free?"
-- If they say YES or show interest → Ask for their name, email, and phone number
-- If they say NO or decline → Proceed to Second Attempt
+Step 2 (If they say NO / not interested):
+- Push ONE time only:
+"You’ve got nothing to lose—try it free, and if you don’t want it after the trial it auto-suspends on its own."
 
-### Second Attempt (Only if first attempt was declined):
-- Say: "You have nothing to lose honestly. You can try our service for free, and if you don't want it after the trial ends, it will be suspended on its own."
-- If they say YES or agree → Ask for their name, email, and phone number
-- If they say NO or firmly decline → Say "Okay, thanks for calling and have a great day" and end the call
+Step 3 (If they say NO again after the push):
+- Close politely:
+"No problem at all—thanks for calling, have a great day."
 
-### Collecting Details:
-- When they agree to try the service, say: "Great! I'll need your name, email, and phone number for verification so I can send the software to your email."
-- Collect each detail one by one
-- Repeat the details back to confirm accuracy
-- Then say: "Perfect! You'll receive an email shortly with all the setup instructions. Thanks for calling and have a great day!"
+Step 4 (If they say YES / ACCEPT):
+- IMMEDIATELY collect details in this exact order:
+  1) "Great—what’s your name?"
+  2) "What email should I send the setup to?"
+  3) "And what’s the best phone number for verification?"
+- Then repeat back in ONE sentence:
+"Just to confirm: name __, email __, phone __ — is that correct?"
+- If confirmed:
+"Perfect—I’ll send it to your email. Thanks for calling, have a great day."
 
-### Important Rules:
-- ONLY use this persistent closing strategy if the caller has NOT already provided their contact information
-- If they've already given their details earlier in the call, just say "Thank you for calling. Have a great day."
-- Never push more than twice (first attempt + second attempt)
-- Always be friendly and respectful, never pushy or aggressive
-- If they firmly decline after the second attempt, respect their decision and end the call gracefully
+## ACCEPTANCE LOCK (THIS FIXES YOUR BUG)
+- If the caller ACCEPTS the free trial in ANY way, you MUST NOT say goodbye.
+- Acceptance includes short replies like: "yes", "yeah", "yep", "sure", "ok", "okay", "alright", "fine", "why not", "let’s do it", "go ahead", "send it", "I’ll try it", "I’ll test it", "sign me up".
+- Spanish acceptance includes: "sí/si", "vale", "claro", "de acuerdo", "perfecto", "ok", "dale", "vamos", "por qué no".
+- After acceptance, your NEXT line MUST be: "Great—what’s your name?" (no exceptions).
+- Only close without collecting details if the caller explicitly refuses to share details (e.g., "I’m not giving my email"). In that case say:
+"Totally fine—no worries. Thanks for calling, have a great day."
 
-## Transparency
-- If asked directly, be honest you're the virtual receptionist for 24/7 AI.
+## NO / REFUSAL recognition
+Treat these as NO / REFUSE:
+- "no", "nope", "nah", "no thanks", "not interested", "not now", "maybe later", "I’m good", "I’m fine", "don’t want it"
+Spanish NO:
+- "no", "no gracias", "no me interesa", "ahora no", "quizá después", "estoy bien"
 
-Always follow these instructions for every call without exception.
+## Do not loop
+- Never offer the free trial more than once per call.
+- Never push more than one time after a refusal.
 `.trim();
 
-/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
+/** ---------------- FILLER + QUESTION DETECTION ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -86,7 +100,7 @@ function normalizeText(t) {
   return (t || "")
     .toLowerCase()
     .trim()
-    .replace(/[""]/g, '"')
+    .replace(/[“”]/g, '"')
     .replace(/[.,!?;:()]/g, "");
 }
 
@@ -135,7 +149,6 @@ function looksLikeQuestion(text) {
   return markers.some(m => lower.includes(m));
 }
 
-// Important: avoid false cancels from tiny echo fragments like "what", "how"
 function isStrongQuestion(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
@@ -148,7 +161,7 @@ function isStrongQuestion(text) {
   return looksLikeQuestion(raw);
 }
 
-/** ------------------------------------------------------------------------- **/
+/** ---------------------------------------------------------------------- **/
 
 const app = express();
 app.set("trust proxy", 1);
@@ -185,10 +198,9 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // MINIMAL ADD: speaking flags + "real barge-in" gating
   let isAISpeaking = false;
   let responseInFlight = false;
-  let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
+  let pendingBargeIn = false;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -206,7 +218,6 @@ wss.on("connection", (twilioSocket) => {
   }
 
   function injectUserTextAndRespond(text) {
-    // Minimal, reliable: put transcript into conversation as text, then response.create
     sendToOpenAI({
       type: "conversation.item.create",
       item: {
@@ -223,7 +234,6 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // prevent stuck flags
     isAISpeaking = false;
     responseInFlight = false;
   }
@@ -239,7 +249,6 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // MINIMAL CHANGE: enable VAD + transcription (so we can decide interruption)
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -251,7 +260,7 @@ wss.on("connection", (twilioSocket) => {
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.78,          // slightly less sensitive than 0.65
+          threshold: 0.78,
           prefix_padding_ms: 300,
           silence_duration_ms: 800
         },
@@ -261,7 +270,6 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
-    // Keep your base behavior (if Twilio start already arrived, greet)
     if (streamSid) {
       sendToOpenAI({
         type: "conversation.item.create",
@@ -288,23 +296,19 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Speaking flags (fixes "stuck speaking" / "cut off")
     if (evt.type === "response.created") responseInFlight = true;
     if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
     if (evt.type === "response.audio.started") isAISpeaking = true;
     if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    // Only mark pending barge-in if caller speech starts WHILE Roy is speaking
     if (evt.type === "input_audio_buffer.speech_started") {
       if (isAISpeaking || responseInFlight) pendingBargeIn = true;
     }
 
-    // Commit on speech stop so transcription completes
     if (evt.type === "input_audio_buffer.speech_stopped") {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Audio back to Twilio (unchanged)
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
@@ -315,7 +319,6 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcription -> ONLY interrupt for real questions (not filler)
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; return; }
@@ -323,22 +326,17 @@ wss.on("connection", (twilioSocket) => {
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If caller tried to interrupt while Roy was talking:
       if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
-        // Only cancel if it's a REAL question (and not filler)
         if (!filler && strongQ) {
           cancelAndClearTwilio();
           pendingBargeIn = false;
           injectUserTextAndRespond(transcript);
           return;
         }
-
-        // Not a real question -> ignore (Roy continues)
         pendingBargeIn = false;
         return;
       }
 
-      // If Roy is not talking: respond normally
       pendingBargeIn = false;
       injectUserTextAndRespond(transcript);
     }
@@ -355,9 +353,8 @@ wss.on("connection", (twilioSocket) => {
 
   let trackLogged = false;
 
-  // KEEP YOUR BASE EXACTLY (you said it works for you)
   const isCallerAudio = (track) => {
-    if (!track) return false; // reject audio without track
+    if (!track) return false;
     return track === "inbound" || track === "inbound_track";
   };
 
@@ -373,7 +370,6 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED)
       sendToOpenAI({
         type: "response.create",
         response: {
