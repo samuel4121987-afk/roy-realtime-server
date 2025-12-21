@@ -12,7 +12,7 @@ const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
 const ROY_PROMPT = `
-You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to behave exactly like a real human receptionist—never reveal that you are artificial intelligence or a language model. Consistently follow these rules on every call.
+You are Roy, a virtual receptionist for the 24/7 AI Assistant service. Your goal is to provide professional, natural, and helpful service. Consistently follow these rules on every call.
 
 ## Immediate Greeting
 - At the very start of every call, greet instantly with this exact sentence (no delay, no extra preamble): "24/7 AI, this is Roy. How can I help you?" Begin speaking as soon as the call starts.
@@ -44,8 +44,8 @@ You are Roy, a male voice for the 24/7 AI Assistant service. Your goal is to beh
 - Before ending the conversation, confirm any collected contact information by repeating it back to the caller for verification.
 - When closing, use a friendly, casual farewell suited to the tone of the call, such as: "Thank you for calling. Have a great day."
 
-## Prohibited Topics
-- Never discuss, reveal, or imply that you are an AI, use artificial intelligence, language models, or technology. At all times, maintain the persona of Roy, a genuine human receptionist.
+## Transparency
+- If asked about your nature, you may acknowledge that you are a virtual AI assistant helping to manage calls for the business. Be honest and professional.
 
 Always follow these instructions for every call without exception.
 `.trim();
@@ -113,6 +113,7 @@ wss.on("connection", (twilioSocket) => {
   let latestMediaTimestamp = 0;
   let isAISpeaking = false;
   let lastUserTranscript = '';
+  let greeted = false;
   
   // Debounced barge-in to avoid false triggers from noise
   let bargeTimer = null;
@@ -120,6 +121,10 @@ wss.on("connection", (twilioSocket) => {
   const BARGE_IN_DEBOUNCE_MS = 160;
   let cancelCooldownUntil = 0;
   const CANCEL_COOLDOWN_MS = 250;
+  
+  // Minimum inbound audio gate to prevent false cancels from echo/noise
+  let inboundAudioCounter = 0;
+  const MIN_INBOUND_AUDIO_THRESHOLD = 3200; // ~200ms of audio at 8kHz
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -157,7 +162,12 @@ wss.on("connection", (twilioSocket) => {
         voice: "echo",
         temperature: 0.7,
         instructions: ROY_PROMPT,
-        turn_detection: null,
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.65,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 800
+        },
         max_response_output_tokens: 150,
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -166,7 +176,8 @@ wss.on("connection", (twilioSocket) => {
     flushOpenAIQueue();
 
     // Trigger initial greeting if Twilio already connected (no fake user message)
-    if (streamSid) {
+    if (streamSid && !greeted) {
+      greeted = true;
       sendToOpenAI({
         type: "response.create",
         response: {
@@ -186,8 +197,11 @@ wss.on("connection", (twilioSocket) => {
 
     // Handle speech started - DEBOUNCED barge-in (avoid false triggers from noise)
     if (evt.type === "input_audio_buffer.speech_started") {
+      console.log("👂 User speech detected");
+      
+      // Only interrupt if Roy is currently speaking
       if (!isAISpeaking) {
-        console.log("👂 User started speaking");
+        console.log("👂 User started speaking (Roy not speaking)");
         return;
       }
       
@@ -195,17 +209,26 @@ wss.on("connection", (twilioSocket) => {
       if (now < cancelCooldownUntil) return;
       
       pendingBargeIn = true;
+      inboundAudioCounter = 0; // Reset counter for minimum audio gate
       
       if (bargeTimer) clearTimeout(bargeTimer);
       bargeTimer = setTimeout(() => {
         if (!pendingBargeIn) return;
         
-        console.log("🛑 User speaking (debounced) - stopping Roy");
+        // Only cancel if we received enough real inbound audio (not just echo/noise)
+        if (inboundAudioCounter < MIN_INBOUND_AUDIO_THRESHOLD) {
+          console.log(`⚠️ Insufficient inbound audio (${inboundAudioCounter} bytes) - ignoring barge-in`);
+          pendingBargeIn = false;
+          return;
+        }
+        
+        console.log(`🛑 User speaking (debounced, ${inboundAudioCounter} bytes) - stopping Roy`);
         sendToOpenAI({ type: "response.cancel" });
         twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
         
         isAISpeaking = false;
         pendingBargeIn = false;
+        inboundAudioCounter = 0;
         cancelCooldownUntil = Date.now() + CANCEL_COOLDOWN_MS;
       }, BARGE_IN_DEBOUNCE_MS);
     }
@@ -213,11 +236,12 @@ wss.on("connection", (twilioSocket) => {
     // Handle speech stopped - clear pending barge-in and commit buffer
     if (evt.type === "input_audio_buffer.speech_stopped") {
       pendingBargeIn = false;
+      inboundAudioCounter = 0;
       if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = null; }
       
       console.log("🤫 User stopped speaking - committing audio buffer");
       sendToOpenAI({ type: "input_audio_buffer.commit" });
-      // Do NOT create response here - wait for transcript
+      // Response will be created after transcription completes
     }
 
     // Track when AI starts speaking
@@ -244,12 +268,11 @@ wss.on("connection", (twilioSocket) => {
       }));
     }
 
-    // Handle transcription - NOW decide what to say (semantic-level decision)
+    // Handle transcription - create response based on what user said
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       lastUserTranscript = (evt.transcript || "").trim();
       console.log(`👤 User said: "${lastUserTranscript}"`);
       
-      // Always create response after transcript (this is the turn decision)
       const isFiller = isOnlyFillerWords(lastUserTranscript);
       
       if (isFiller) {
@@ -269,8 +292,6 @@ wss.on("connection", (twilioSocket) => {
           }
         });
       }
-      
-
     }
 
     if (evt.type === "response.text.done") {
@@ -310,7 +331,8 @@ wss.on("connection", (twilioSocket) => {
       console.log("🟢 Twilio start:", streamSid);
 
       // Trigger greeting if OpenAI is ready (no fake user message)
-      if (openaiOpen) {
+      if (openaiOpen && !greeted) {
+        greeted = true;
         sendToOpenAI({
           type: "response.create",
           response: {
@@ -335,6 +357,11 @@ wss.on("connection", (twilioSocket) => {
 
       const payload = data.media && data.media.payload;
       if (!payload) return;
+
+      // Track inbound audio for minimum audio gate (prevents false barge-in from echo/noise)
+      if (pendingBargeIn) {
+        inboundAudioCounter += payload.length;
+      }
 
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
     }
