@@ -55,7 +55,7 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 Always follow these instructions for every call without exception.
 `.trim();
 
-/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
+/** ---------------- MINIMAL ADD: filler detection ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -83,50 +83,6 @@ function isOnlyFillerWords(text) {
   if (w.length === 0) return true;
   if (w.length > 4) return false;
   return w.every(x => FILLER_WORDS.has(x));
-}
-
-function looksLikeQuestion(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-  if (raw.includes("?")) return true;
-
-  const w = wordsOf(raw);
-  if (w.length === 0) return false;
-
-  const starters = new Set([
-    "who","what","when","where","why","how",
-    "can","could","do","does","did",
-    "is","are","am","was","were",
-    "will","would","should",
-    "tell","explain",
-    // Spanish common
-    "qué","que","cómo","como","cuándo","cuando","dónde","donde","cuánto","cuanto",
-    "puedo","puede","podría","podria"
-  ]);
-
-  if (starters.has(w[0])) return true;
-
-  const lower = raw.toLowerCase();
-  const markers = [
-    "price","pricing","cost","charge","fee","fees","rate","rates",
-    "book","booking","reserve","reservation","schedule","setup","onboard","onboarding",
-    "how much","what is","what are",
-    "precio","coste","costo","tarifa","reservar","reserva","cita","configurar","instalar"
-  ];
-  return markers.some(m => lower.includes(m));
-}
-
-// Avoid false “question” from tiny fragments like “what”, “how”
-function isStrongQuestion(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-  if (raw.includes("?")) return true;
-
-  const w = wordsOf(raw);
-  const cleanedLen = normalizeText(raw).replace(/\s+/g, " ").length;
-
-  if (w.length < 3 && cleanedLen < 12) return false;
-  return looksLikeQuestion(raw);
 }
 
 /** ------------------------------------------------------------------------- **/
@@ -169,27 +125,22 @@ wss.on("connection", (twilioSocket) => {
   // speaking flags
   let isAISpeaking = false;
   let responseInFlight = false;
-  let pendingBargeIn = false;
 
-  // FAST STOP tuning
-  let bargePacketCount = 0;
-  let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 2; // snappy
+  // Approach A: Two-phase barge-in
+  // Phase 1: stop Roy fast on real overlap (don’t wait for transcript)
+  // Phase 2: when transcript arrives -> if filler: resume, else respond
   let aiSpeechStartedAt = 0;
-  const BARGE_GRACE_MS = 350;
-
-  // cancel / transcript handling
+  let overlapPackets = 0;
+  let preCancelFired = false;      // we canceled due to overlap and are waiting for transcript
   let cancelInProgress = false;
+
+  // Snappy tuning you requested
+  const PRE_CANCEL_PACKETS = 2;    // aggressive (2) / safer (3)
+  const BARGE_GRACE_MS = 350;      // balanced
+
+  // Queue decision until cancel settles
   let queuedTranscript = null;
-
-  // ✅ prevent “answered twice” from duplicate transcription events
-  let lastProcessedTranscript = "";
-  let lastProcessedAt = 0;
-  const TRANSCRIPT_DEDUPE_MS = 1200;
-
-  // ✅ capture what Roy was saying so he can resume naturally after interrupt
-  let currentAssistantText = "";
-  let lastAssistantText = "";
+  let queuedMode = null; // "RESPOND" | "RESUME" | null
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -206,30 +157,28 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function injectUserTextAndRespond(text, { interrupted = false, resumeSnippet = "" } = {}) {
-    let userText = text;
-
-    // If this came from an interruption question, force a “human” pivot + resume
-    if (interrupted) {
-      const snippet = (resumeSnippet || "").trim();
-      userText =
-        `Caller interrupted you mid-sentence with a question.\n` +
-        `1) Start with a quick human interjection like "Yeah—" or "Sure—" (one beat), then answer the question clearly in 1–2 sentences.\n` +
-        `2) Then say exactly: "And like I was saying," and continue the previous explanation naturally without restarting.\n` +
-        (snippet ? `Here is the last thing you were saying (continue from it, don’t repeat it): ${snippet}\n` : "") +
-        `Question: ${text}`;
-    }
-
+  function injectUserTextAndRespond(text) {
     sendToOpenAI({
       type: "conversation.item.create",
       item: {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: userText }]
+        content: [{ type: "input_text", text }]
       }
     });
-
     sendToOpenAI({ type: "response.create" });
+  }
+
+  function resumePreviousThought() {
+    // No user message. Just ask Roy to continue naturally.
+    sendToOpenAI({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions:
+          "Continue exactly where you left off. Keep it natural and short (finish the thought in 1 sentence)."
+      }
+    });
   }
 
   function cancelAndClearTwilio() {
@@ -238,7 +187,27 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // Do NOT force flags false here (prevents “Roy goes silent”).
+    // Do NOT force flags false here (this is what causes “Roy goes silent”).
+  }
+
+  function maybeRunQueuedAction() {
+    if (cancelInProgress || isAISpeaking || responseInFlight) return;
+    if (!queuedMode) return;
+
+    const mode = queuedMode;
+    const t = queuedTranscript;
+
+    queuedMode = null;
+    queuedTranscript = null;
+
+    if (mode === "RESUME") {
+      resumePreviousThought();
+      return;
+    }
+    if (mode === "RESPOND" && t) {
+      injectUserTextAndRespond(t);
+      return;
+    }
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -272,19 +241,6 @@ wss.on("connection", (twilioSocket) => {
     });
 
     flushOpenAIQueue();
-
-    // Keep base behavior
-    if (streamSid) {
-      sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "Please greet the caller now." }]
-        }
-      });
-      sendToOpenAI({ type: "response.create" });
-    }
   });
 
   openaiSocket.on("message", (raw) => {
@@ -300,65 +256,41 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
-    // Capture assistant text for resume-after-interrupt
-    if (evt.type === "response.text.delta" && evt.delta) {
-      currentAssistantText += String(evt.delta);
-    }
-    if (evt.type === "response.text.done" && typeof evt.text === "string") {
-      // Some servers send full text here; prefer it if present
-      currentAssistantText = evt.text;
-    }
-
     // Speaking flags
-    if (evt.type === "response.created") {
-      responseInFlight = true;
-      currentAssistantText = ""; // start new assistant utterance capture
-    }
+    if (evt.type === "response.created") responseInFlight = true;
 
     if (evt.type === "response.done") {
       responseInFlight = false;
       isAISpeaking = false;
       cancelInProgress = false;
 
-      // finalize assistant text capture
-      if (currentAssistantText && currentAssistantText.trim()) {
-        lastAssistantText = currentAssistantText.trim();
-      }
-      currentAssistantText = "";
-
-      if (queuedTranscript) {
-        const t = queuedTranscript;
-        queuedTranscript = null;
-        injectUserTextAndRespond(t);
-      }
+      // After cancel settles, run queued action if any
+      maybeRunQueuedAction();
     }
 
     if (evt.type === "response.audio.started") {
       isAISpeaking = true;
       aiSpeechStartedAt = Date.now();
+
+      // reset overlap window each time Roy starts speaking
+      overlapPackets = 0;
+      preCancelFired = false;
     }
 
     if (evt.type === "response.audio.done") {
       isAISpeaking = false;
+      // If we had something queued and cancel already done, try now
+      maybeRunQueuedAction();
     }
 
-    // Mark pending barge-in if caller speech starts while Roy is speaking
-    if (evt.type === "input_audio_buffer.speech_started") {
-      if (isAISpeaking || responseInFlight) {
-        pendingBargeIn = true;
-        bargePacketCount = 0;
-        preCancelFired = false;
-      }
-    }
-
-    // Commit on speech stop
+    // Commit on speech stop so transcription completes
     if (evt.type === "input_audio_buffer.speech_stopped") {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Audio to Twilio
+    // Audio back to Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
-      if (cancelInProgress) return;
+      if (cancelInProgress) return; // drop stale frames during cancel
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
           event: "media",
@@ -368,81 +300,48 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Transcription completed
+    // Transcription completed (Phase 2 decision)
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
-      if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
-
-      // Dedupe identical transcripts arriving twice
-      const now = Date.now();
-      if (
-        transcript.toLowerCase() === lastProcessedTranscript.toLowerCase() &&
-        (now - lastProcessedAt) < TRANSCRIPT_DEDUPE_MS
-      ) {
+      if (!transcript) {
+        // If we pre-canceled but got empty transcript, just resume
+        if (preCancelFired) {
+          preCancelFired = false;
+          queuedMode = "RESUME";
+          queuedTranscript = null;
+          maybeRunQueuedAction();
+        }
         return;
       }
-      lastProcessedTranscript = transcript;
-      lastProcessedAt = now;
 
       const filler = isOnlyFillerWords(transcript);
-      const strongQ = isStrongQuestion(transcript);
 
-      // If we pre-canceled (Roy stopped instantly), decide what to do now:
+      // If we stopped Roy due to overlap, decide now:
       if (preCancelFired) {
-        pendingBargeIn = false;
         preCancelFired = false;
 
-        if (filler) return;
-
-        // Only “hard-interrupt” behavior when it’s a real question
-        if (strongQ) {
-          const snippet = lastAssistantText ? lastAssistantText.slice(-320) : "";
-          if (cancelInProgress || isAISpeaking || responseInFlight) {
-            queuedTranscript = transcript;
-            return;
-          }
-          injectUserTextAndRespond(transcript, { interrupted: true, resumeSnippet: snippet });
+        if (filler) {
+          // User just said “yeah/ok/uh-huh” -> resume what Roy was saying
+          queuedMode = "RESUME";
+          queuedTranscript = null;
+          maybeRunQueuedAction();
           return;
         }
 
-        // Not a question -> treat as normal turn
-        if (cancelInProgress || isAISpeaking || responseInFlight) {
-          queuedTranscript = transcript;
-          return;
-        }
+        // Real speech -> answer it (snappy)
+        queuedMode = "RESPOND";
+        queuedTranscript = transcript;
+        maybeRunQueuedAction();
+        return;
+      }
+
+      // Normal turn (Roy not interrupted): just respond
+      if (!cancelInProgress && !isAISpeaking && !responseInFlight) {
         injectUserTextAndRespond(transcript);
-        return;
+      } else {
+        queuedMode = "RESPOND";
+        queuedTranscript = transcript;
       }
-
-      // If caller interrupted while Roy was talking but we didn't pre-cancel:
-      if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
-        pendingBargeIn = false;
-
-        if (filler) return;
-
-        // Only stop-and-pivot if it's a real question
-        if (strongQ) {
-          cancelAndClearTwilio();
-          const snippet = lastAssistantText ? lastAssistantText.slice(-320) : "";
-
-          if (cancelInProgress || isAISpeaking || responseInFlight) {
-            // queue and handle on response.done
-            queuedTranscript = transcript;
-            return;
-          }
-
-          injectUserTextAndRespond(transcript, { interrupted: true, resumeSnippet: snippet });
-          return;
-        }
-
-        // Not a question -> ignore interruption and let Roy continue
-        return;
-      }
-
-      // Normal turn when Roy isn't talking
-      pendingBargeIn = false;
-      preCancelFired = false;
-      injectUserTextAndRespond(transcript);
     }
   });
 
@@ -474,7 +373,7 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED)
+      // Greeting (keep EXACT)
       sendToOpenAI({
         type: "response.create",
         response: {
@@ -500,14 +399,21 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // FAST STOP: cancel quickly once caller is truly speaking over Roy (after grace window)
-      if ((isAISpeaking || responseInFlight) && pendingBargeIn && !preCancelFired) {
-        if (Date.now() - aiSpeechStartedAt > BARGE_GRACE_MS) {
-          bargePacketCount += 1;
-          if (bargePacketCount >= PRE_CANCEL_PACKETS) {
+      // Phase 1: fast stop on overlap (don’t wait for transcript)
+      // Only after a short grace window (prevents greeting echo cancel)
+      if (!preCancelFired && !cancelInProgress && (isAISpeaking || responseInFlight)) {
+        const sinceStart = Date.now() - aiSpeechStartedAt;
+
+        if (sinceStart > BARGE_GRACE_MS) {
+          overlapPackets += 1;
+
+          if (overlapPackets >= PRE_CANCEL_PACKETS) {
             preCancelFired = true;
+            overlapPackets = 0;
+
+            // STOP Roy now
             cancelAndClearTwilio();
-            // transcript will arrive; we pivot ONLY if it's a real question
+            // transcript will arrive; Phase 2 decides filler->resume or real->respond
           }
         }
       }
