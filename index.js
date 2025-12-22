@@ -55,7 +55,7 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 Always follow these instructions for every call without exception.
 `.trim();
 
-/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
+/** ---------------- MINIMAL ADD: filler detection ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -122,21 +122,24 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // speaking flags + “real barge-in” gating
+  // speaking flags
   let isAISpeaking = false;
   let responseInFlight = false;
   let pendingBargeIn = false;
 
-  // ✅ FAST STOP: cancel quickly when caller speaks while Roy is speaking
+  // ✅ FAST STOP tuning (more “11-labs”)
   let bargePacketCount = 0;
   let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 6; // a bit safer than 4 (reduces noise cancels)
 
-  // ✅ Grace window so echo/background doesn’t cancel greeting
+  // Faster than before: ~40ms of sustained inbound audio
+  // (Twilio sends ~20ms packets; 2 packets = ~40ms)
+  const PRE_CANCEL_PACKETS = 2;
+
+  // Short grace window to avoid echo canceling greeting
   let aiSpeechStartedAt = 0;
-  const BARGE_GRACE_MS = 650;
+  const BARGE_GRACE_MS = 350;
 
-  // ✅ If we pre-cancel, we wait for transcript then respond (unless filler)
+  // If we pre-cancel, we wait for transcript then respond (unless filler)
   let cancelInProgress = false;
   let queuedTranscript = null;
 
@@ -173,8 +176,7 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // IMPORTANT: do NOT force isAISpeaking/responseInFlight false here.
-    // Let response.done / audio.done clear flags to avoid “Roy goes silent” bugs.
+    // Do NOT force flags false here (prevents “Roy goes silent” bugs).
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -209,7 +211,6 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
-    // Keep your base behavior (if Twilio start already arrived, greet)
     if (streamSid) {
       sendToOpenAI({
         type: "conversation.item.create",
@@ -244,7 +245,6 @@ wss.on("connection", (twilioSocket) => {
       isAISpeaking = false;
       cancelInProgress = false;
 
-      // If we queued something while canceling/speaking, send it now
       if (queuedTranscript) {
         const t = queuedTranscript;
         queuedTranscript = null;
@@ -299,10 +299,9 @@ wss.on("connection", (twilioSocket) => {
         pendingBargeIn = false;
         preCancelFired = false;
 
-        // Only ignore if pure filler
+        // If it's pure filler, don't respond at all (keeps convo natural)
         if (filler) return;
 
-        // If cancel is still settling, queue it; else respond now
         if (cancelInProgress || isAISpeaking || responseInFlight) {
           queuedTranscript = transcript;
           return;
@@ -315,13 +314,14 @@ wss.on("connection", (twilioSocket) => {
       if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
         pendingBargeIn = false;
 
-        // If it's filler, ignore and let Roy continue
+        // If filler, ignore and let Roy continue
         if (filler) return;
 
-        // Otherwise: cancel and respond (question OR statement)
+        // Otherwise: cancel and respond immediately
         cancelAndClearTwilio();
-        // If cancel is still in progress, queue; else respond immediately
-        if (cancelInProgress) {
+
+        // If cancel is still settling, queue; else respond now
+        if (cancelInProgress || isAISpeaking || responseInFlight) {
           queuedTranscript = transcript;
           return;
         }
@@ -391,7 +391,7 @@ wss.on("connection", (twilioSocket) => {
       if (!payload) return;
 
       // ✅ FAST STOP: if caller speaks while Roy is speaking, cancel quickly
-      // (but only after a grace window to avoid echo canceling the greeting)
+      // after a short grace window to avoid greeting echo cancellation
       if ((isAISpeaking || responseInFlight) && pendingBargeIn && !preCancelFired) {
         if (Date.now() - aiSpeechStartedAt > BARGE_GRACE_MS) {
           bargePacketCount += 1;
@@ -399,7 +399,7 @@ wss.on("connection", (twilioSocket) => {
           if (bargePacketCount >= PRE_CANCEL_PACKETS) {
             preCancelFired = true;
             cancelAndClearTwilio(); // stop Roy NOW
-            // wait for transcript to decide filler vs real message
+            // transcript will arrive and we respond unless it's filler
           }
         }
       }
