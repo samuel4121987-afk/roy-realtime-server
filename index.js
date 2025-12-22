@@ -131,6 +131,26 @@ function isStrongQuestion(text) {
   return looksLikeQuestion(raw);
 }
 
+/** ---------------- MINIMAL ADD: μ-law energy ---------------- **/
+
+function muLawToPcm16(u) {
+  u = ~u & 0xff;
+  const sign = (u & 0x80) ? -1 : 1;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
+  magnitude -= 33;
+  return sign * magnitude;
+}
+
+function avgAbsEnergyFromMulawPayload(base64) {
+  const buf = Buffer.from(base64, "base64");
+  if (!buf.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += Math.abs(muLawToPcm16(buf[i]));
+  return sum / buf.length;
+}
+
 /** ------------------------------------------------------------------------- **/
 
 const app = express();
@@ -173,11 +193,28 @@ wss.on("connection", (twilioSocket) => {
   let responseInFlight = false;
   let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
 
-  // ✅ NEW (MINIMAL): stop Roy immediately on real user talk while Roy is speaking
-  // We wait for a few inbound packets so we don't cancel on tiny "yeah/ok".
+  // ✅ CHANGE #2: track real outgoing audio activity
+  let lastAiAudioAt = 0;
+
+  // ✅ CHANGE #3: speakingNow definition
+  function speakingNow() {
+    return (
+      isAISpeaking ||
+      responseInFlight ||
+      (Date.now() - lastAiAudioAt < 350)
+    );
+  }
+
+  // ✅ Two-phase: fast stop based on overlap energy
   let bargePacketCount = 0;
   let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 4; // ~80ms (tune: 4-8)
+
+  // TUNING
+  const PRE_CANCEL_PACKETS = 3;     // 2 = aggressive, 3 = safer/snappy
+  const ENERGY_THRESHOLD = 900;     // tune if needed (1100 if too sensitive)
+
+  // ✅ CHANGE #5: cancel-in-progress gate for audio forwarding
+  let cancelInProgress = false;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -207,13 +244,13 @@ wss.on("connection", (twilioSocket) => {
   }
 
   function cancelAndClearTwilio() {
+    cancelInProgress = true;
     sendToOpenAI({ type: "response.cancel" });
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // prevent stuck flags
-    isAISpeaking = false;
-    responseInFlight = false;
+    // IMPORTANT: do NOT force isAISpeaking/responseInFlight false here.
+    // We'll let OpenAI events settle them, and we gate audio output via cancelInProgress.
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -278,13 +315,23 @@ wss.on("connection", (twilioSocket) => {
 
     // Speaking flags
     if (evt.type === "response.created") responseInFlight = true;
-    if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
+    if (evt.type === "response.done") {
+      responseInFlight = false;
+      isAISpeaking = false;
+      cancelInProgress = false; // cancel settled
+      preCancelFired = false;
+      pendingBargeIn = false;
+      bargePacketCount = 0;
+    }
     if (evt.type === "response.audio.started") isAISpeaking = true;
-    if (evt.type === "response.audio.done") isAISpeaking = false;
+    if (evt.type === "response.audio.done") {
+      isAISpeaking = false;
+      cancelInProgress = false; // cancel settled
+    }
 
     // Only mark pending barge-in if caller speech starts WHILE Roy is speaking
     if (evt.type === "input_audio_buffer.speech_started") {
-      if (isAISpeaking || responseInFlight) {
+      if (speakingNow()) {
         pendingBargeIn = true;
         bargePacketCount = 0;
         preCancelFired = false;
@@ -296,18 +343,22 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Audio back to Twilio (unchanged)
+    // ✅ CHANGE #2: lastAiAudioAt updated on every forwarded delta
+    // ✅ CHANGE #5: while cancelInProgress, do NOT forward any deltas
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
-      if (twilioSocket.readyState === WebSocket.OPEN) {
-        twilioSocket.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: evt.delta },
-        }));
+      if (!cancelInProgress) {
+        lastAiAudioAt = Date.now();
+        if (twilioSocket.readyState === WebSocket.OPEN) {
+          twilioSocket.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: evt.delta },
+          }));
+        }
       }
     }
 
-    // Handle transcription -> ONLY interrupt for real questions (not filler)
+    // Phase 2 (smart): decide when transcript arrives
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
@@ -315,42 +366,23 @@ wss.on("connection", (twilioSocket) => {
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If caller tried to interrupt while Roy was talking:
-      if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
-        // Only cancel if it's a REAL question (and not filler)
-        if (!filler && strongQ) {
-          cancelAndClearTwilio();
-          pendingBargeIn = false;
-          preCancelFired = false;
-          injectUserTextAndRespond(transcript);
-          return;
-        }
-
-        // Not a real question -> ignore (Roy continues)
-        pendingBargeIn = false;
-        preCancelFired = false;
-        return;
-      }
-
-      // If we already pre-canceled (so Roy stopped instantly), now decide what to do.
+      // If we pre-canceled (fast stop), now decide:
       if (preCancelFired) {
         pendingBargeIn = false;
         preCancelFired = false;
 
-        // If it was filler, just acknowledge briefly.
-        if (filler) {
-          injectUserTextAndRespond("Okay.");
-          return;
-        }
+        // filler -> ignore (resume naturally)
+        if (filler) return;
 
-        // Otherwise answer normally (question or statement)
+        // only answer if it's a real question (your requirement)
+        if (!strongQ) return;
+
         injectUserTextAndRespond(transcript);
         return;
       }
 
-      // If Roy is not talking: respond normally
+      // Normal if Roy isn't speaking
       pendingBargeIn = false;
-      preCancelFired = false;
       injectUserTextAndRespond(transcript);
     }
   });
@@ -384,7 +416,7 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED)
+      // Greeting (UNCHANGED) — DO NOT TOUCH
       sendToOpenAI({
         type: "response.create",
         response: {
@@ -410,15 +442,23 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // ✅ NEW (MINIMAL): if caller keeps talking while Roy is speaking -> STOP Roy immediately
-      if (pendingBargeIn && (isAISpeaking || responseInFlight) && !preCancelFired) {
-        bargePacketCount += 1;
+      // ✅ CHANGE #4:
+      // If Roy is speakingNow() and we detect sustained caller energy,
+      // cancel + clear immediately (Phase 1 fast).
+      if (speakingNow() && pendingBargeIn && !preCancelFired) {
+        const energy = avgAbsEnergyFromMulawPayload(payload);
 
-        // after enough real packets, treat as real interruption and cancel NOW
-        if (bargePacketCount >= PRE_CANCEL_PACKETS) {
-          preCancelFired = true;
-          cancelAndClearTwilio();
-          // wait for transcript to decide filler vs question
+        if (energy >= ENERGY_THRESHOLD) {
+          bargePacketCount += 1;
+
+          if (bargePacketCount >= PRE_CANCEL_PACKETS) {
+            preCancelFired = true;
+            bargePacketCount = 0;
+            cancelAndClearTwilio(); // stop Roy NOW
+          }
+        } else {
+          // decay so noise doesn't accumulate
+          if (bargePacketCount > 0) bargePacketCount -= 1;
         }
       }
 
