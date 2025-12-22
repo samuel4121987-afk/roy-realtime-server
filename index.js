@@ -131,26 +131,6 @@ function isStrongQuestion(text) {
   return looksLikeQuestion(raw);
 }
 
-/** ---------------- MINIMAL ADD: μ-law energy (caller speech detection) ----- **/
-
-function muLawToPcm16(u) {
-  u = ~u & 0xff;
-  const sign = (u & 0x80) ? -1 : 1;
-  const exponent = (u >> 4) & 0x07;
-  const mantissa = u & 0x0f;
-  let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
-  magnitude -= 33;
-  return sign * magnitude;
-}
-
-function avgAbsEnergyFromMulawPayload(base64) {
-  const buf = Buffer.from(base64, "base64");
-  if (!buf.length) return 0;
-  let sum = 0;
-  for (let i = 0; i < buf.length; i++) sum += Math.abs(muLawToPcm16(buf[i]));
-  return sum / buf.length;
-}
-
 /** ------------------------------------------------------------------------- **/
 
 const app = express();
@@ -191,30 +171,13 @@ wss.on("connection", (twilioSocket) => {
   // speaking flags + “real barge-in” gating
   let isAISpeaking = false;
   let responseInFlight = false;
+  let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
 
-  // IMPORTANT: actual “Roy is outputting audio” tracker
-  let lastAiAudioAt = 0;
-
-  // Approach A — Phase 1 fast stop
+  // ✅ NEW (MINIMAL): stop Roy immediately on real user talk while Roy is speaking
+  // We wait for a few inbound packets so we don't cancel on tiny "yeah/ok".
   let bargePacketCount = 0;
   let preCancelFired = false;
-  let cancelInProgress = false;
-
-  // TUNING (snappy):
-  const PRE_CANCEL_PACKETS = 2; // 2 = aggressive/snappy
-  const BARGE_GRACE_MS = 250;   // short grace to avoid greeting echo cancellation
-  const ENERGY_THRESHOLD = 850; // lower = easier to interrupt, higher = safer vs noise
-
-  let aiSpeechStartedAt = 0;
-
-  function speakingNow() {
-    // This is the key: don’t rely only on response.audio.started
-    return (
-      isAISpeaking ||
-      responseInFlight ||
-      (Date.now() - lastAiAudioAt < 350)
-    );
-  }
+  const PRE_CANCEL_PACKETS = 4; // ~80ms (tune: 4-8)
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -244,13 +207,13 @@ wss.on("connection", (twilioSocket) => {
   }
 
   function cancelAndClearTwilio() {
-    cancelInProgress = true;
     sendToOpenAI({ type: "response.cancel" });
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
-      // one extra clear helps flush queued audio on some setups
-      twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
+    // prevent stuck flags
+    isAISpeaking = false;
+    responseInFlight = false;
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -315,27 +278,17 @@ wss.on("connection", (twilioSocket) => {
 
     // Speaking flags
     if (evt.type === "response.created") responseInFlight = true;
+    if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
+    if (evt.type === "response.audio.started") isAISpeaking = true;
+    if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    if (evt.type === "response.done") {
-      responseInFlight = false;
-      isAISpeaking = false;
-      cancelInProgress = false;
-      bargePacketCount = 0;
-      preCancelFired = false;
-    }
-
-    if (evt.type === "response.audio.started") {
-      isAISpeaking = true;
-      aiSpeechStartedAt = Date.now();
-      bargePacketCount = 0;
-      preCancelFired = false;
-    }
-
-    if (evt.type === "response.audio.done") {
-      isAISpeaking = false;
-      cancelInProgress = false;
-      bargePacketCount = 0;
-      preCancelFired = false;
+    // Only mark pending barge-in if caller speech starts WHILE Roy is speaking
+    if (evt.type === "input_audio_buffer.speech_started") {
+      if (isAISpeaking || responseInFlight) {
+        pendingBargeIn = true;
+        bargePacketCount = 0;
+        preCancelFired = false;
+      }
     }
 
     // Commit on speech stop so transcription completes
@@ -343,11 +296,8 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Audio back to Twilio (IMPORTANT: stop sending audio if we canceled)
+    // Audio back to Twilio (unchanged)
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
-      lastAiAudioAt = Date.now();
-      if (cancelInProgress) return;
-
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
           event: "media",
@@ -357,33 +307,51 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcription (Phase 2 smart)
+    // Handle transcription -> ONLY interrupt for real questions (not filler)
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
-      if (!transcript) { preCancelFired = false; return; }
+      if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If we pre-canceled (Roy stopped instantly), decide what to do now:
+      // If caller tried to interrupt while Roy was talking:
+      if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
+        // Only cancel if it's a REAL question (and not filler)
+        if (!filler && strongQ) {
+          cancelAndClearTwilio();
+          pendingBargeIn = false;
+          preCancelFired = false;
+          injectUserTextAndRespond(transcript);
+          return;
+        }
+
+        // Not a real question -> ignore (Roy continues)
+        pendingBargeIn = false;
+        preCancelFired = false;
+        return;
+      }
+
+      // If we already pre-canceled (so Roy stopped instantly), now decide what to do.
       if (preCancelFired) {
+        pendingBargeIn = false;
         preCancelFired = false;
 
-        // filler -> ignore (resume naturally)
-        if (filler) return;
+        // If it was filler, just acknowledge briefly.
+        if (filler) {
+          injectUserTextAndRespond("Okay.");
+          return;
+        }
 
-        // ONLY questions should get answered mid-barage (your requirement)
-        if (!strongQ) return;
-
-        // now answer immediately
+        // Otherwise answer normally (question or statement)
         injectUserTextAndRespond(transcript);
         return;
       }
 
-      // Normal: if Roy is not speaking, respond as usual
-      if (!speakingNow()) {
-        injectUserTextAndRespond(transcript);
-      }
+      // If Roy is not talking: respond normally
+      pendingBargeIn = false;
+      preCancelFired = false;
+      injectUserTextAndRespond(transcript);
     }
   });
 
@@ -416,7 +384,7 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED) — DO NOT TOUCH
+      // Greeting (UNCHANGED)
       sendToOpenAI({
         type: "response.create",
         response: {
@@ -442,30 +410,18 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // PHASE 1 FAST STOP (works even if OpenAI speech_started lags)
-      if (speakingNow() && !preCancelFired) {
-        const sinceAiSpeech = Date.now() - aiSpeechStartedAt;
+      // ✅ NEW (MINIMAL): if caller keeps talking while Roy is speaking -> STOP Roy immediately
+      if (pendingBargeIn && (isAISpeaking || responseInFlight) && !preCancelFired) {
+        bargePacketCount += 1;
 
-        // grace window prevents greeting echo cancel
-        if (sinceAiSpeech >= BARGE_GRACE_MS) {
-          const energy = avgAbsEnergyFromMulawPayload(payload);
-
-          if (energy >= ENERGY_THRESHOLD) {
-            bargePacketCount += 1;
-
-            if (bargePacketCount >= PRE_CANCEL_PACKETS) {
-              preCancelFired = true;
-              bargePacketCount = 0;
-              cancelAndClearTwilio(); // STOP Roy NOW
-            }
-          } else {
-            // quick decay
-            if (bargePacketCount > 0) bargePacketCount -= 1;
-          }
+        // after enough real packets, treat as real interruption and cancel NOW
+        if (bargePacketCount >= PRE_CANCEL_PACKETS) {
+          preCancelFired = true;
+          cancelAndClearTwilio();
+          // wait for transcript to decide filler vs question
         }
       }
 
-      // Always pass caller audio to OpenAI
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
