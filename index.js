@@ -55,7 +55,7 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 Always follow these instructions for every call without exception.
 `.trim();
 
-/** ---------------- MINIMAL ADD: filler detection ---------------- **/
+/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -83,6 +83,50 @@ function isOnlyFillerWords(text) {
   if (w.length === 0) return true;
   if (w.length > 4) return false;
   return w.every(x => FILLER_WORDS.has(x));
+}
+
+function looksLikeQuestion(text) {
+  const raw = (text || "").trim();
+  if (!raw) return false;
+  if (raw.includes("?")) return true;
+
+  const w = wordsOf(raw);
+  if (w.length === 0) return false;
+
+  const starters = new Set([
+    "who","what","when","where","why","how",
+    "can","could","do","does","did",
+    "is","are","am","was","were",
+    "will","would","should",
+    "tell","explain",
+    // Spanish common
+    "qué","que","cómo","como","cuándo","cuando","dónde","donde","cuánto","cuanto",
+    "puedo","puede","podría","podria"
+  ]);
+
+  if (starters.has(w[0])) return true;
+
+  const lower = raw.toLowerCase();
+  const markers = [
+    "price","pricing","cost","charge","fee","fees","rate","rates",
+    "book","booking","reserve","reservation","schedule","setup","onboard","onboarding",
+    "how much","what is","what are",
+    "precio","coste","costo","tarifa","reservar","reserva","cita","configurar","instalar"
+  ];
+  return markers.some(m => lower.includes(m));
+}
+
+// Avoid false “question” from tiny fragments like “what”, “how”
+function isStrongQuestion(text) {
+  const raw = (text || "").trim();
+  if (!raw) return false;
+  if (raw.includes("?")) return true;
+
+  const w = wordsOf(raw);
+  const cleanedLen = normalizeText(raw).replace(/\s+/g, " ").length;
+
+  if (w.length < 3 && cleanedLen < 12) return false;
+  return looksLikeQuestion(raw);
 }
 
 /** ------------------------------------------------------------------------- **/
@@ -127,20 +171,25 @@ wss.on("connection", (twilioSocket) => {
   let responseInFlight = false;
   let pendingBargeIn = false;
 
-  // ✅ FAST STOP tuning (more “human snappy”)
+  // FAST STOP tuning
   let bargePacketCount = 0;
   let preCancelFired = false;
-
-  // SNAPPY: 2 packets (~40ms) then cancel
-  const PRE_CANCEL_PACKETS = 2;
-
-  // SNAPPY: lower grace window so Roy stops sooner when you start talking
+  const PRE_CANCEL_PACKETS = 2; // snappy
   let aiSpeechStartedAt = 0;
-  const BARGE_GRACE_MS = 220;
+  const BARGE_GRACE_MS = 350;
 
-  // If we pre-cancel, we wait for transcript then respond (unless filler)
+  // cancel / transcript handling
   let cancelInProgress = false;
   let queuedTranscript = null;
+
+  // ✅ prevent “answered twice” from duplicate transcription events
+  let lastProcessedTranscript = "";
+  let lastProcessedAt = 0;
+  const TRANSCRIPT_DEDUPE_MS = 1200;
+
+  // ✅ capture what Roy was saying so he can resume naturally after interrupt
+  let currentAssistantText = "";
+  let lastAssistantText = "";
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -157,15 +206,29 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function injectUserTextAndRespond(text) {
+  function injectUserTextAndRespond(text, { interrupted = false, resumeSnippet = "" } = {}) {
+    let userText = text;
+
+    // If this came from an interruption question, force a “human” pivot + resume
+    if (interrupted) {
+      const snippet = (resumeSnippet || "").trim();
+      userText =
+        `Caller interrupted you mid-sentence with a question.\n` +
+        `1) Start with a quick human interjection like "Yeah—" or "Sure—" (one beat), then answer the question clearly in 1–2 sentences.\n` +
+        `2) Then say exactly: "And like I was saying," and continue the previous explanation naturally without restarting.\n` +
+        (snippet ? `Here is the last thing you were saying (continue from it, don’t repeat it): ${snippet}\n` : "") +
+        `Question: ${text}`;
+    }
+
     sendToOpenAI({
       type: "conversation.item.create",
       item: {
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text }]
+        content: [{ type: "input_text", text: userText }]
       }
     });
+
     sendToOpenAI({ type: "response.create" });
   }
 
@@ -175,7 +238,7 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // Do NOT force flags false here (prevents “Roy goes silent” bugs).
+    // Do NOT force flags false here (prevents “Roy goes silent”).
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -210,6 +273,7 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
+    // Keep base behavior
     if (streamSid) {
       sendToOpenAI({
         type: "conversation.item.create",
@@ -236,13 +300,31 @@ wss.on("connection", (twilioSocket) => {
       return;
     }
 
+    // Capture assistant text for resume-after-interrupt
+    if (evt.type === "response.text.delta" && evt.delta) {
+      currentAssistantText += String(evt.delta);
+    }
+    if (evt.type === "response.text.done" && typeof evt.text === "string") {
+      // Some servers send full text here; prefer it if present
+      currentAssistantText = evt.text;
+    }
+
     // Speaking flags
-    if (evt.type === "response.created") responseInFlight = true;
+    if (evt.type === "response.created") {
+      responseInFlight = true;
+      currentAssistantText = ""; // start new assistant utterance capture
+    }
 
     if (evt.type === "response.done") {
       responseInFlight = false;
       isAISpeaking = false;
       cancelInProgress = false;
+
+      // finalize assistant text capture
+      if (currentAssistantText && currentAssistantText.trim()) {
+        lastAssistantText = currentAssistantText.trim();
+      }
+      currentAssistantText = "";
 
       if (queuedTranscript) {
         const t = queuedTranscript;
@@ -291,16 +373,39 @@ wss.on("connection", (twilioSocket) => {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
 
+      // Dedupe identical transcripts arriving twice
+      const now = Date.now();
+      if (
+        transcript.toLowerCase() === lastProcessedTranscript.toLowerCase() &&
+        (now - lastProcessedAt) < TRANSCRIPT_DEDUPE_MS
+      ) {
+        return;
+      }
+      lastProcessedTranscript = transcript;
+      lastProcessedAt = now;
+
       const filler = isOnlyFillerWords(transcript);
+      const strongQ = isStrongQuestion(transcript);
 
       // If we pre-canceled (Roy stopped instantly), decide what to do now:
       if (preCancelFired) {
         pendingBargeIn = false;
         preCancelFired = false;
 
-        // If it's pure filler, don't respond at all (keeps convo natural)
         if (filler) return;
 
+        // Only “hard-interrupt” behavior when it’s a real question
+        if (strongQ) {
+          const snippet = lastAssistantText ? lastAssistantText.slice(-320) : "";
+          if (cancelInProgress || isAISpeaking || responseInFlight) {
+            queuedTranscript = transcript;
+            return;
+          }
+          injectUserTextAndRespond(transcript, { interrupted: true, resumeSnippet: snippet });
+          return;
+        }
+
+        // Not a question -> treat as normal turn
         if (cancelInProgress || isAISpeaking || responseInFlight) {
           queuedTranscript = transcript;
           return;
@@ -313,17 +418,24 @@ wss.on("connection", (twilioSocket) => {
       if ((isAISpeaking || responseInFlight) && pendingBargeIn) {
         pendingBargeIn = false;
 
-        // If filler, ignore and let Roy continue
         if (filler) return;
 
-        // Otherwise: cancel and respond immediately
-        cancelAndClearTwilio();
+        // Only stop-and-pivot if it's a real question
+        if (strongQ) {
+          cancelAndClearTwilio();
+          const snippet = lastAssistantText ? lastAssistantText.slice(-320) : "";
 
-        if (cancelInProgress || isAISpeaking || responseInFlight) {
-          queuedTranscript = transcript;
+          if (cancelInProgress || isAISpeaking || responseInFlight) {
+            // queue and handle on response.done
+            queuedTranscript = transcript;
+            return;
+          }
+
+          injectUserTextAndRespond(transcript, { interrupted: true, resumeSnippet: snippet });
           return;
         }
-        injectUserTextAndRespond(transcript);
+
+        // Not a question -> ignore interruption and let Roy continue
         return;
       }
 
@@ -388,16 +500,14 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // ✅ SNAPPY STOP: if caller speaks while Roy is speaking, cancel quickly
-      // after a short grace window to avoid greeting echo cancellation
+      // FAST STOP: cancel quickly once caller is truly speaking over Roy (after grace window)
       if ((isAISpeaking || responseInFlight) && pendingBargeIn && !preCancelFired) {
         if (Date.now() - aiSpeechStartedAt > BARGE_GRACE_MS) {
           bargePacketCount += 1;
-
           if (bargePacketCount >= PRE_CANCEL_PACKETS) {
             preCancelFired = true;
-            cancelAndClearTwilio(); // stop Roy NOW
-            // transcript will arrive and we respond unless it's filler
+            cancelAndClearTwilio();
+            // transcript will arrive; we pivot ONLY if it's a real question
           }
         }
       }
