@@ -127,17 +127,16 @@ wss.on("connection", (twilioSocket) => {
   let responseInFlight = false;
   let pendingBargeIn = false;
 
-  // ✅ FAST STOP tuning (more “11-labs”)
+  // ✅ FAST STOP tuning (more “human snappy”)
   let bargePacketCount = 0;
   let preCancelFired = false;
 
-  // Faster than before: ~40ms of sustained inbound audio
-  // (Twilio sends ~20ms packets; 2 packets = ~40ms)
+  // SNAPPY: 2 packets (~40ms) then cancel
   const PRE_CANCEL_PACKETS = 2;
 
-  // Short grace window to avoid echo canceling greeting
+  // SNAPPY: lower grace window so Roy stops sooner when you start talking
   let aiSpeechStartedAt = 0;
-  const BARGE_GRACE_MS = 350;
+  const BARGE_GRACE_MS = 220;
 
   // If we pre-cancel, we wait for transcript then respond (unless filler)
   let cancelInProgress = false;
@@ -320,7 +319,6 @@ wss.on("connection", (twilioSocket) => {
         // Otherwise: cancel and respond immediately
         cancelAndClearTwilio();
 
-        // If cancel is still settling, queue; else respond now
         if (cancelInProgress || isAISpeaking || responseInFlight) {
           queuedTranscript = transcript;
           return;
@@ -390,7 +388,7 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // ✅ FAST STOP: if caller speaks while Roy is speaking, cancel quickly
+      // ✅ SNAPPY STOP: if caller speaks while Roy is speaking, cancel quickly
       // after a short grace window to avoid greeting echo cancellation
       if ((isAISpeaking || responseInFlight) && pendingBargeIn && !preCancelFired) {
         if (Date.now() - aiSpeechStartedAt > BARGE_GRACE_MS) {
