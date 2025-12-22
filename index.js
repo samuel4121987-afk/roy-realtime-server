@@ -168,19 +168,24 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // speaking flags + “real barge-in” gating
+  // Speaking flags
   let isAISpeaking = false;
   let responseInFlight = false;
-  let pendingBargeIn = false; // set only when speech_started happens DURING Roy speaking
 
-  // ✅ existing packet-based stop (kept)
-  let bargePacketCount = 0;
+  // ---------------- Approach A: Two-phase barge-in ----------------
+  // Phase 1 FAST stop: cancel after short confirmed overlap.
+  // Tune these ONLY:
+  const PRE_CANCEL_PACKETS = 3; // 2 = super snappy but more echo risk; 3 = safer; 4 = safer
+  const BARGE_GRACE_MS = 250;   // 200-350 is typical; lower = snappier but more echo risk
+
+  let aiAudioStartedAt = 0;
+  let overlapPacketCount = 0;
   let preCancelFired = false;
-  const PRE_CANCEL_PACKETS = 4; // ~80ms (tune: 4-8)
 
-  // ✅ NEW (MINIMAL): grace window + instant cancel on speech_started (Approach A Phase 1)
-  let aiSpeechStartedAt = 0;
-  const BARGE_GRACE_MS = 300; // protects greeting/echo; lower = snappier, higher = safer
+  // Phase 2 SMART: when transcript arrives, decide to respond or ignore filler
+  let pendingDecision = false;     // we stopped Roy; waiting for transcript decision
+  let queuedTranscript = null;     // if we must wait until cancel settles
+  // ---------------------------------------------------------------
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -197,15 +202,9 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function injectUserTextAndRespond(text) {
-    sendToOpenAI({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text }]
-      }
-    });
+  // IMPORTANT: do NOT create a second user message from transcript.
+  // The server already creates a user audio item when we commit the buffer.
+  function requestResponseNow() {
     sendToOpenAI({ type: "response.create" });
   }
 
@@ -214,9 +213,6 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // keep your original behavior
-    isAISpeaking = false;
-    responseInFlight = false;
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -230,7 +226,9 @@ wss.on("connection", (twilioSocket) => {
     openaiOpen = true;
     console.log("✅ OpenAI WS connected");
 
-    // enable VAD + transcription (so we can decide interruption)
+    // Keep your config, but add proper turn_detection knobs:
+    // - interrupt_response: true  (lets Roy be interrupted)
+    // - create_response: false    (prevents auto-responses that cause doubles)
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -240,13 +238,40 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
+
+        // Keep your existing shape (works with your setup)
         turn_detection: {
           type: "server_vad",
           threshold: 0.78,
           prefix_padding_ms: 300,
-          silence_duration_ms: 800
+          silence_duration_ms: 800,
+
+          // Key fix:
+          interrupt_response: true,
+          create_response: false,
         },
+
         input_audio_transcription: { model: "whisper-1" },
+
+        // Also include the newer nested shape (harmless if ignored; helpful if honored)
+        audio: {
+          input: {
+            format: { type: "audio/g711_ulaw", rate: 8000 },
+            transcription: { model: "whisper-1" },
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.78,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 800,
+              interrupt_response: true,
+              create_response: false,
+            }
+          },
+          output: {
+            format: { type: "audio/g711_ulaw", rate: 8000 },
+            voice: "alloy",
+          }
+        }
       },
     });
 
@@ -281,23 +306,35 @@ wss.on("connection", (twilioSocket) => {
 
     // Speaking flags
     if (evt.type === "response.created") responseInFlight = true;
-    if (evt.type === "response.done") { responseInFlight = false; isAISpeaking = false; }
-    if (evt.type === "response.audio.started") { isAISpeaking = true; aiSpeechStartedAt = Date.now(); }
-    if (evt.type === "response.audio.done") isAISpeaking = false;
 
-    // ✅ Approach A Phase 1: instant stop as soon as speech starts over Roy (after grace)
-    if (evt.type === "input_audio_buffer.speech_started") {
-      if (isAISpeaking || responseInFlight) {
-        pendingBargeIn = true;
-        bargePacketCount = 0;
+    if (evt.type === "response.audio.started") {
+      isAISpeaking = true;
+      aiAudioStartedAt = Date.now();
+      overlapPacketCount = 0;
+      preCancelFired = false;
+    }
 
-        // only allow fast-stop after grace window (prevents greeting echo cancellation)
-        if (Date.now() - aiSpeechStartedAt > BARGE_GRACE_MS) {
-          preCancelFired = true;
-          cancelAndClearTwilio(); // STOP ROY NOW, don't wait for transcript
-        } else {
-          preCancelFired = false;
-        }
+    if (evt.type === "response.audio.done") {
+      isAISpeaking = false;
+      overlapPacketCount = 0;
+      preCancelFired = false;
+    }
+
+    if (evt.type === "response.done") {
+      responseInFlight = false;
+      isAISpeaking = false;
+      overlapPacketCount = 0;
+      preCancelFired = false;
+
+      // If we queued a transcript while cancel was settling, answer now
+      if (queuedTranscript) {
+        const t = queuedTranscript;
+        queuedTranscript = null;
+
+        const filler = isOnlyFillerWords(t);
+        const strongQ = isStrongQuestion(t);
+
+        if (!filler && strongQ) requestResponseNow();
       }
     }
 
@@ -317,32 +354,49 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // ✅ Approach A Phase 2: decide what to do once transcript arrives
+    // Phase 2: smart decision once transcript arrives
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
-      if (!transcript) { pendingBargeIn = false; preCancelFired = false; return; }
+      if (!transcript) {
+        pendingDecision = false;
+        return;
+      }
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If we fast-stopped Roy already, now act on the transcript
-      if (preCancelFired) {
-        pendingBargeIn = false;
+      // If we canceled Roy already (phase 1), decide what to do:
+      if (pendingDecision || preCancelFired) {
+        pendingDecision = false;
         preCancelFired = false;
 
-        // filler -> ignore (Roy stays quiet; convo feels natural)
+        // filler -> ignore (no response)
         if (filler) return;
 
-        // only answer if it's a real question (your requirement)
-        if (strongQ) {
-          injectUserTextAndRespond(transcript);
+        // Only answer if it's a real question (your requirement)
+        if (!strongQ) return;
+
+        // If cancel is still settling, queue
+        if (isAISpeaking || responseInFlight) {
+          queuedTranscript = transcript;
+          return;
         }
+
+        requestResponseNow();
         return;
       }
 
-      // If Roy is not talking: respond normally
-      pendingBargeIn = false;
-      injectUserTextAndRespond(transcript);
+      // Normal case: Roy is not talking, user finished speaking
+      if (filler) return;
+
+      if (strongQ) {
+        requestResponseNow();
+      } else {
+        // Not a question; let Roy handle naturally only if you want.
+        // For now, keep quiet to avoid “Roy yaps” on statements.
+        // If you want statements answered too, flip this on:
+        // requestResponseNow();
+      }
     }
   });
 
@@ -375,7 +429,7 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED)
+      // Greeting (UNCHANGED — do not touch)
       sendToOpenAI({
         type: "response.create",
         response: {
@@ -401,15 +455,26 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Keep your existing packet-based stop as a fallback (unchanged)
-      if (pendingBargeIn && (isAISpeaking || responseInFlight) && !preCancelFired) {
-        bargePacketCount += 1;
-        if (bargePacketCount >= PRE_CANCEL_PACKETS) {
-          preCancelFired = true;
-          cancelAndClearTwilio();
+      // Phase 1 FAST STOP:
+      // If caller is speaking over Roy for long enough -> cancel immediately.
+      if ((isAISpeaking || responseInFlight)) {
+        const sinceAiStart = Date.now() - aiAudioStartedAt;
+
+        // grace window avoids canceling on greeting echo
+        if (sinceAiStart > BARGE_GRACE_MS) {
+          overlapPacketCount += 1;
+
+          if (!preCancelFired && overlapPacketCount >= PRE_CANCEL_PACKETS) {
+            preCancelFired = true;
+            pendingDecision = true; // wait for transcript to decide filler vs question
+            cancelAndClearTwilio();
+          }
         }
+      } else {
+        overlapPacketCount = 0;
       }
 
+      // Always feed caller audio
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
