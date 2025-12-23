@@ -363,7 +363,7 @@ wss.on("connection", (twilioSocket) => {
 
     // Commit on speech stop so transcription completes
     if (evt.type === "input_audio_buffer.speech_stopped") {
-      sendToOpenAI({ type: "input_audio_buffer.commit" });
+      // Skip commit to avoid empty buffer errors - OpenAI handles this automatically
     }
 
     // Track AI audio output + HARD MUTE while canceling
