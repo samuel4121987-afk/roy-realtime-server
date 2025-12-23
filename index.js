@@ -70,7 +70,8 @@ function normalizeText(t) {
     .toLowerCase()
     .trim()
     .replace(/[“”]/g, '"')
-    .replace(/[.,!?;:()]/g, "");
+    .replace(/[.,!?;:()]/g, "")
+    .replace(/\s+/g, " ");
 }
 
 function wordsOf(t) {
@@ -124,7 +125,7 @@ function isStrongQuestion(text) {
   if (raw.includes("?")) return true;
 
   const w = wordsOf(raw);
-  const cleanedLen = normalizeText(raw).replace(/\s+/g, " ").length;
+  const cleanedLen = normalizeText(raw).length;
 
   if (w.length < 3 && cleanedLen < 12) return false;
   return looksLikeQuestion(raw);
@@ -220,8 +221,8 @@ wss.on("connection", (twilioSocket) => {
   let lastAiAudioAt = 0;
   let aiSpeechStartedAt = 0;
 
-  // Optional: stop double answers if transcript repeats
-  let lastTranscript = "";
+  // De-dupe transcript (normalized)
+  let lastTranscriptNorm = "";
   let lastTranscriptAt = 0;
 
   // TUNING
@@ -266,7 +267,6 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // IMPORTANT: do NOT force isAISpeaking/responseInFlight to false here.
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -300,6 +300,11 @@ wss.on("connection", (twilioSocket) => {
     });
 
     flushOpenAIQueue();
+
+    // Safety net: if Twilio start already arrived and greeting got queued weirdly, resend once.
+    if (streamSid && greetingInFlight && !bargeEnabled) {
+      // do nothing — we already have greeting in flight
+    }
   });
 
   openaiSocket.on("message", (raw) => {
@@ -330,16 +335,15 @@ wss.on("connection", (twilioSocket) => {
       responseInFlight = false;
       isAISpeaking = false;
 
-      // Greeting completed → enable barge-in
+      // Greeting completed → enable barge-in and listening
       if (greetingInFlight) {
         greetingInFlight = false;
         bargeEnabled = true;
         console.log("✅ Greeting finished → barge-in ENABLED");
       }
 
-      // End cancel/hard-mute window cleanly
       cancelInProgress = false;
-      bargeInProgress = false;
+      // leave bargeInProgress to be cleared on transcript decision
       energyPacketCount = 0;
     }
 
@@ -352,10 +356,7 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       lastAiAudioAt = Date.now();
 
-      if (cancelInProgress) {
-        // critical: don't forward post-cancel tail audio
-        return;
-      }
+      if (cancelInProgress) return;
 
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
@@ -375,30 +376,42 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
-      // De-dupe transcript to prevent double answering
+      // CRITICAL: ignore any transcript while greeting is still in flight
+      if (greetingInFlight) return;
+
+      // Stronger dedupe (normalized)
       const now = Date.now();
-      if (transcript === lastTranscript && (now - lastTranscriptAt) < 900) {
+      const norm = normalizeText(transcript);
+      if (norm && norm === lastTranscriptNorm && (now - lastTranscriptAt) < 1500) {
         return;
       }
-      lastTranscript = transcript;
+      lastTranscriptNorm = norm;
       lastTranscriptAt = now;
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If we barge-canceled Roy, only respond if it's a real question
+      // If we barge-canceled Roy:
       if (bargeInProgress) {
         bargeInProgress = false;
         cancelInProgress = false;
         energyPacketCount = 0;
 
-        if (!filler && strongQ) {
-          injectUserTextAndRespond(transcript);
-        }
+        // FIX: never go silent after barge-in.
+        // - filler => ignore
+        // - anything else (question OR statement) => respond
+        if (filler) return;
+
+        injectUserTextAndRespond(transcript);
         return;
       }
 
-      // Normal flow when Roy isn't speaking
+      // Normal flow: ignore filler, otherwise respond
+      if (filler) return;
+
+      // If you want “question-only replies” in normal flow, uncomment:
+      // if (!strongQ) return;
+
       injectUserTextAndRespond(transcript);
     }
   });
@@ -431,9 +444,12 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
+      // GREETING: lock barge-in and BLOCK inbound audio until greeting done
       greetingInFlight = true;
-      bargeEnabled = false; // lock barge-in during greeting
+      bargeEnabled = false;
+      bargeInProgress = false;
+      cancelInProgress = false;
+      energyPacketCount = 0;
 
       sendToOpenAI({
         type: "response.create",
@@ -461,6 +477,9 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
+      // HARD BLOCK: ignore caller audio completely while greeting is playing
+      if (greetingInFlight) return;
+
       // Phase 1: instant stop based on energy overlap
       if (bargeEnabled && !bargeInProgress && speakingNow()) {
         const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
@@ -473,7 +492,6 @@ wss.on("connection", (twilioSocket) => {
               cancelInProgress = true;
               energyPacketCount = 0;
               cancelAndClearTwilio();
-              // Phase 2 decides after transcript (filler => ignore, question => answer)
             }
           } else {
             energyPacketCount = 0;
@@ -483,7 +501,7 @@ wss.on("connection", (twilioSocket) => {
         energyPacketCount = 0;
       }
 
-      // Always append audio for transcription
+      // Always append audio for transcription (post-greeting)
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
