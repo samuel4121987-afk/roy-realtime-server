@@ -451,19 +451,25 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
+      // ✅ FORCE GREETING - inject assistant message then create response
       greetingInFlight = true;
       bargeEnabled = false; // lock barge-in during greeting
 
+      // First, inject the greeting as an assistant message
       sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          commit: true,
-        },
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [{ 
+            type: "input_text", 
+            text: "24/7 AI, this is Roy. How can I help you?" 
+          }]
+        }
       });
+
+      // Then immediately create a response to speak it
+      sendToOpenAI({ type: "response.create" });
 
       return;
     }
