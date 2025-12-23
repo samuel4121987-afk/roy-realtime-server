@@ -289,17 +289,26 @@ wss.on("connection", (twilioSocket) => {
         voice: "alloy",
         temperature: 0.6,
         instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.78,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 800
-        },
+        turn_detection: null,
         input_audio_transcription: { model: "whisper-1" },
       },
     });
 
     flushOpenAIQueue();
+
+    // Send greeting immediately after session is configured
+    if (streamSid) {
+      greetingInFlight = true;
+      bargeEnabled = false;
+      sendToOpenAI({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          temperature: 0,
+          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+        },
+      });
+    }
   });
 
   openaiSocket.on("message", (raw) => {
@@ -346,6 +355,7 @@ wss.on("connection", (twilioSocket) => {
     // Commit on speech stop so transcription completes
     if (evt.type === "input_audio_buffer.speech_stopped") {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
+      // Don't auto-respond, wait for transcript
     }
 
     // Track AI audio output + HARD MUTE while canceling
@@ -399,7 +409,9 @@ wss.on("connection", (twilioSocket) => {
       }
 
       // Normal flow when Roy isn't speaking
-      injectUserTextAndRespond(transcript);
+      if (!filler) {
+        injectUserTextAndRespond(transcript);
+      }
     }
   });
 
@@ -431,19 +443,19 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
-      greetingInFlight = true;
-      bargeEnabled = false; // lock barge-in during greeting
-
-      sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          commit: true,
-        },
-      });
+      // Trigger greeting if OpenAI is already connected
+      if (openaiOpen && openaiSocket.readyState === WebSocket.OPEN) {
+        greetingInFlight = true;
+        bargeEnabled = false;
+        sendToOpenAI({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            temperature: 0,
+            instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+          },
+        });
+      }
 
       return;
     }
