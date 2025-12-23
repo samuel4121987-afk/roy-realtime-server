@@ -55,7 +55,7 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 Always follow these instructions for every call without exception.
 `.trim();
 
-/** ---------------- Filler + question detection ---------------- **/
+/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -117,6 +117,7 @@ function looksLikeQuestion(text) {
   return markers.some(m => lower.includes(m));
 }
 
+// Important: avoid false cancels from tiny echo fragments like "what", "how"
 function isStrongQuestion(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
@@ -129,10 +130,12 @@ function isStrongQuestion(text) {
   return looksLikeQuestion(raw);
 }
 
-/** ---------------- µ-law energy detection (Twilio µ-law invert) ---------------- **/
+/** ---------------- ELEVENLABS-STYLE: µ-law energy detection (FIXED) ---------------- **/
 
 function ulawByteToPcm16(b) {
+  // Twilio µ-law byte must be inverted
   let u = (~b) & 0xff;
+
   const sign = u & 0x80;
   const exponent = (u >> 4) & 0x07;
   const mantissa = u & 0x0f;
@@ -165,7 +168,7 @@ function ulawEnergyDb(base64Payload) {
   return 20 * Math.log10(norm + 1e-10);
 }
 
-/** ---------------- Server ---------------- **/
+/** ------------------------------------------------------------------------- **/
 
 const app = express();
 app.set("trust proxy", 1);
@@ -199,7 +202,6 @@ wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
-
   let openaiOpen = false;
   const openaiQueue = [];
 
@@ -207,27 +209,25 @@ wss.on("connection", (twilioSocket) => {
   let isAISpeaking = false;
   let responseInFlight = false;
 
-  // greeting enforcement
-  let greetingInFlight = false; // greeting response is currently playing
-  let bargeEnabled = false;      // locked until greeting is DONE
-
-  // barge-in state
-  let bargeInProgress = false;  // we have canceled and are awaiting transcript decision
-  let cancelInProgress = false; // hard mute AI audio after cancel
+  // barge state
+  let bargeEnabled = false;     // 🔒 LOCKED until greeting finishes
+  let greetingInFlight = false; // track the initial greeting response
+  let bargeInProgress = false;  // Phase 1 fired
+  let cancelInProgress = false; // hard mute window
   let energyPacketCount = 0;
 
-  // "real output" timestamps
+  // "real audio activity" tracking
   let lastAiAudioAt = 0;
   let aiSpeechStartedAt = 0;
 
-  // transcript dedupe
+  // Optional: stop double answers if transcript repeats
   let lastTranscript = "";
   let lastTranscriptAt = 0;
 
-  // TUNING (keep close to your “working” behavior)
-  const ENERGY_THRESHOLD_DB = -50;
-  const PRE_CANCEL_PACKETS = 2; // ~40ms
-  const BARGE_GRACE_MS = 120;
+  // TUNING
+  const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
+  const PRE_CANCEL_PACKETS = 2;    // ~40ms
+  const BARGE_GRACE_MS = 120;      // after AI audio starts
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -266,7 +266,7 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // IMPORTANT: do not force isAISpeaking/responseInFlight false here.
+    // IMPORTANT: do NOT force isAISpeaking/responseInFlight to false here.
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -300,22 +300,6 @@ wss.on("connection", (twilioSocket) => {
     });
 
     flushOpenAIQueue();
-
-    // If Twilio start already happened but greeting didn't fire yet, force it.
-    if (streamSid && !greetingInFlight && !bargeEnabled) {
-      greetingInFlight = true;
-      bargeEnabled = false;
-
-      sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          commit: true,
-        },
-      });
-    }
   });
 
   openaiSocket.on("message", (raw) => {
@@ -346,15 +330,16 @@ wss.on("connection", (twilioSocket) => {
       responseInFlight = false;
       isAISpeaking = false;
 
-      // Greeting finished => now allow listening + barge-in
+      // Greeting completed → enable barge-in
       if (greetingInFlight) {
         greetingInFlight = false;
         bargeEnabled = true;
-        console.log("✅ Greeting finished → listening ENABLED");
+        console.log("✅ Greeting finished → barge-in ENABLED");
       }
 
+      // End cancel/hard-mute window cleanly
       cancelInProgress = false;
-      // Do not automatically drop bargeInProgress here; we drop it on transcription event.
+      bargeInProgress = false;
       energyPacketCount = 0;
     }
 
@@ -363,11 +348,14 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Send AI audio to Twilio (hard mute after cancel)
+    // Track AI audio output + HARD MUTE while canceling
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       lastAiAudioAt = Date.now();
 
-      if (cancelInProgress) return;
+      if (cancelInProgress) {
+        // critical: don't forward post-cancel tail audio
+        return;
+      }
 
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
@@ -378,7 +366,7 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Handle transcript (this is where silence-after-interrupt was coming from)
+    // Phase 2 decision after transcript
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) {
@@ -387,13 +375,7 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
-      // If greeting is still in flight, IGNORE any transcript.
-      // This prevents: greeting -> "sure I can help with that" nonsense.
-      if (greetingInFlight) {
-        return;
-      }
-
-      // Deduplicate
+      // De-dupe transcript to prevent double answering
       const now = Date.now();
       if (transcript === lastTranscript && (now - lastTranscriptAt) < 900) {
         return;
@@ -404,27 +386,19 @@ wss.on("connection", (twilioSocket) => {
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
-      // If we barge-canceled Roy:
+      // If we barge-canceled Roy, only respond if it's a real question
       if (bargeInProgress) {
         bargeInProgress = false;
         cancelInProgress = false;
         energyPacketCount = 0;
 
-        // FIX: do NOT go silent.
-        // - If filler => ignore
-        // - Otherwise => respond (question OR statement)
-        if (filler) return;
-
-        injectUserTextAndRespond(transcript);
+        if (!filler && strongQ) {
+          injectUserTextAndRespond(transcript);
+        }
         return;
       }
 
-      // Normal flow: respond to any non-filler; filler ignored
-      if (filler) return;
-
-      // Optional: If you ONLY want responses to questions, toggle this:
-      // if (!strongQ) return;
-
+      // Normal flow when Roy isn't speaking
       injectUserTextAndRespond(transcript);
     }
   });
@@ -457,12 +431,9 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // FORCE GREETING immediately (this is the behavior from your “greeting worked” version)
+      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
       greetingInFlight = true;
-      bargeEnabled = false;
-      bargeInProgress = false;
-      cancelInProgress = false;
-      energyPacketCount = 0;
+      bargeEnabled = false; // lock barge-in during greeting
 
       sendToOpenAI({
         type: "response.create",
@@ -490,13 +461,7 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // HARD RULE YOU ASKED FOR:
-      // While greeting is in flight, IGNORE caller audio completely.
-      if (greetingInFlight) {
-        return;
-      }
-
-      // Phase 1: energy-based barge-in
+      // Phase 1: instant stop based on energy overlap
       if (bargeEnabled && !bargeInProgress && speakingNow()) {
         const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
         if (!grace) {
@@ -508,7 +473,7 @@ wss.on("connection", (twilioSocket) => {
               cancelInProgress = true;
               energyPacketCount = 0;
               cancelAndClearTwilio();
-              // transcription handler will decide what to do next
+              // Phase 2 decides after transcript (filler => ignore, question => answer)
             }
           } else {
             energyPacketCount = 0;
@@ -518,7 +483,7 @@ wss.on("connection", (twilioSocket) => {
         energyPacketCount = 0;
       }
 
-      // Always append audio for transcription once greeting is done
+      // Always append audio for transcription
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
