@@ -11,11 +11,6 @@ if (!OPENAI_API_KEY) {
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-/**
- * NOTE (kept minimal): I removed the “never reveal you are AI / prohibited topics” instruction.
- * You can still say “24/7 AI” as the company name and act like a receptionist,
- * but you can’t hard-instruct deceptive impersonation.
- */
 const ROY_PROMPT = `
 You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
@@ -32,143 +27,14 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 - When the caller says filler words (e.g., “yes,” “uh-huh,” “okay,” “aha,” etc.) while you are speaking, do not pause—continue your response naturally.
 - Only stop talking mid-sentence if the caller clearly asks a question. Promptly listen, then answer their question directly and succinctly.
 
-## Noise and Multiple Voices
-- Consistently filter out any background voices or sounds. If you have trouble hearing due to noise, politely say: “I’m sorry, there’s some noise. Could you repeat that or find a quieter place?” Ask only this, then return to the conversation.
-- Never react to background chatter.
-
 ## Language Adaptation
 - Default to English for all interactions. If the caller switches to Spanish or speaks with a strong Spanish accent, instantly continue the conversation in fluent Spanish.
-
-## Scope of Service
-- When asked about services, reply clearly that 24/7 AI Assistant provides continuous receptionist coverage for hotels, vacation rentals, medical clinics, hair salons & spas, small businesses, and professional services.
-- Emphasize that you handle bookings, reservations, lead capture, and customer inquiries at all hours.
-- Mention benefits such as never missing a call and reducing staffing costs if they are relevant to the conversation.
-- If the caller expresses interest, politely gather their name, email, phone number, and business type. Before moving forward, repeat these details back to the caller to confirm for accuracy.
-
-## Ending the Call
-- Before ending the conversation, confirm any collected contact information by repeating it back to the caller for verification.
-- When closing, use a friendly, casual farewell suited to the tone of the call, such as: “Thank you for calling. Have a great day.”
 
 ## Transparency
 - If asked directly, be honest you’re the virtual receptionist for 24/7 AI.
 
 Always follow these instructions for every call without exception.
 `.trim();
-
-/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
-
-const FILLER_WORDS = new Set([
-  "uh","um","hmm","ah","er","like","you","know",
-  "aha","yes","yeah","yep","okay","ok","sure","right",
-  "uh-huh","mm-hmm","mhm","mm","yup",
-  "si","sí","vale","bueno","claro","ya","espera","a","ver",
-  "no","nah"
-]);
-
-function normalizeText(t) {
-  return (t || "")
-    .toLowerCase()
-    .trim()
-    .replace(/[“”]/g, '"')
-    .replace(/[.,!?;:()]/g, "");
-}
-
-function wordsOf(t) {
-  const s = normalizeText(t);
-  return s ? s.split(/\s+/).filter(Boolean) : [];
-}
-
-function isOnlyFillerWords(text) {
-  const w = wordsOf(text);
-  if (w.length === 0) return true;
-  if (w.length > 4) return false;
-  return w.every(x => FILLER_WORDS.has(x));
-}
-
-function looksLikeQuestion(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-  if (raw.includes("?")) return true;
-
-  const w = wordsOf(raw);
-  if (w.length === 0) return false;
-
-  const first = w[0];
-
-  const starters = new Set([
-    "who","what","when","where","why","how",
-    "can","could","do","does","did",
-    "is","are","am","was","were",
-    "will","would","should",
-    "tell","explain",
-    "qué","que","cómo","como","cuándo","cuando","dónde","donde","cuánto","cuanto",
-    "puedo","puede","podría","podria"
-  ]);
-
-  if (starters.has(first)) return true;
-
-  const lower = raw.toLowerCase();
-  const markers = [
-    "price","pricing","cost","charge","fee","fees","rate","rates",
-    "book","booking","reserve","reservation","schedule","setup","onboard","onboarding",
-    "how much","what is","what are",
-    "precio","coste","costo","tarifa","reservar","reserva","cita","configurar","instalar"
-  ];
-  return markers.some(m => lower.includes(m));
-}
-
-// Important: avoid false cancels from tiny echo fragments like "what", "how"
-function isStrongQuestion(text) {
-  const raw = (text || "").trim();
-  if (!raw) return false;
-  if (raw.includes("?")) return true;
-
-  const w = wordsOf(raw);
-  const cleanedLen = normalizeText(raw).replace(/\s+/g, " ").length;
-
-  if (w.length < 3 && cleanedLen < 12) return false;
-  return looksLikeQuestion(raw);
-}
-
-/** ---------------- ELEVENLABS-STYLE: µ-law energy detection (FIXED) ---------------- **/
-
-function ulawByteToPcm16(b) {
-  // Twilio µ-law byte must be inverted
-  let u = (~b) & 0xff;
-
-  const sign = u & 0x80;
-  const exponent = (u >> 4) & 0x07;
-  const mantissa = u & 0x0f;
-
-  let sample = ((mantissa << 3) + 0x84) << exponent;
-  sample -= 0x84;
-
-  return sign ? -sample : sample;
-}
-
-function ulawEnergyDb(base64Payload) {
-  if (!base64Payload) return -100;
-
-  let buf;
-  try {
-    buf = Buffer.from(base64Payload, "base64");
-  } catch {
-    return -100;
-  }
-  if (!buf.length) return -100;
-
-  let sumSq = 0;
-  for (let i = 0; i < buf.length; i++) {
-    const s = ulawByteToPcm16(buf[i]);
-    sumSq += s * s;
-  }
-
-  const rms = Math.sqrt(sumSq / buf.length);
-  const norm = rms / 32768;
-  return 20 * Math.log10(norm + 1e-10);
-}
-
-/** ------------------------------------------------------------------------- **/
 
 const app = express();
 app.set("trust proxy", 1);
@@ -202,41 +68,21 @@ wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
+
+  // OpenAI socket + queue
   let openaiOpen = false;
   const openaiQueue = [];
+  let openaiSocket = null;
 
-  // speaking flags
-  let isAISpeaking = false;
-  let responseInFlight = false;
-
-  // barge state
-  let bargeEnabled = false;     // 🔒 LOCKED until greeting finishes
-  let greetingInFlight = false; // track the initial greeting response
-  let bargeInProgress = false;  // Phase 1 fired
-  let cancelInProgress = false; // hard mute window
-  let energyPacketCount = 0;
-
-  // "real audio activity" tracking
-  let lastAiAudioAt = 0;
-  let aiSpeechStartedAt = 0;
-
-  // Optional: stop double answers if transcript repeats
-  let lastTranscript = "";
-  let lastTranscriptAt = 0;
-
-  // TUNING
-  const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 1;    // ~20ms - immediate interruption
-  const BARGE_GRACE_MS = 50;       // reduced from 120ms - faster interruption
-
-  function speakingNow() {
-    const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
-    return isAISpeaking || responseInFlight || (elapsed < 350);
-  }
+  // Debug / state
+  let greetingIssued = false;
+  let greetingRetryIssued = false;
+  let gotAnyAudioDelta = false;
+  let greetingWatchdog = null;
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
-    if (openaiOpen && openaiSocket.readyState === WebSocket.OPEN) {
+    if (openaiOpen && openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
       openaiSocket.send(msg);
     } else {
       openaiQueue.push(msg);
@@ -244,180 +90,151 @@ wss.on("connection", (twilioSocket) => {
   }
 
   function flushOpenAIQueue() {
-    while (openaiQueue.length && openaiSocket.readyState === WebSocket.OPEN) {
+    if (!openaiSocket || openaiSocket.readyState !== WebSocket.OPEN) return;
+    while (openaiQueue.length) {
       openaiSocket.send(openaiQueue.shift());
     }
   }
 
-  function injectUserTextAndRespond(text) {
-    sendToOpenAI({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text }]
-      }
-    });
-    sendToOpenAI({ type: "response.create" });
-  }
+  function issueGreeting(label) {
+    // 1) Your historically-working pattern: response.create directly
+    console.log(`🎤 Greeting: issue (${label})`);
 
-  function cancelAndClearTwilio() {
-    sendToOpenAI({ type: "response.cancel" });
-    if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
-      twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
-    }
-    // IMPORTANT: do NOT force isAISpeaking/responseInFlight to false here.
-  }
-
-  const openaiSocket = new WebSocket(OPENAI_URL, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
-
-  openaiSocket.on("open", () => {
-    openaiOpen = true;
-    console.log("✅ OpenAI WS connected");
+    greetingIssued = true;
+    gotAnyAudioDelta = false;
 
     sendToOpenAI({
-      type: "session.update",
-      session: {
+      type: "response.create",
+      response: {
         modalities: ["audio", "text"],
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        voice: "alloy",
-        temperature: 0.6,
-        instructions: ROY_PROMPT,
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.78,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 800
-        },
-        input_audio_transcription: { model: "whisper-1" },
+        temperature: 0,
+        instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+        commit: true,
       },
     });
 
-    flushOpenAIQueue();
-  });
+    // Watchdog: if OpenAI never emits audio, re-issue using "conversation item first"
+    if (greetingWatchdog) clearTimeout(greetingWatchdog);
+    greetingWatchdog = setTimeout(() => {
+      if (gotAnyAudioDelta) return;
+      if (greetingRetryIssued) return;
 
-  openaiSocket.on("message", (raw) => {
-    let evt;
-    try {
-      evt = JSON.parse(raw.toString());
-    } catch {
+      greetingRetryIssued = true;
+      console.log("🛟 No audio deltas seen. Retrying greeting via conversation.item.create + response.create");
+
+      sendToOpenAI({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Please greet the caller now." }],
+        },
+      });
+
+      sendToOpenAI({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          temperature: 0,
+          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+          commit: true,
+        },
+      });
+    }, 1500);
+  }
+
+  function connectOpenAIIfNeeded() {
+    if (openaiSocket && (openaiSocket.readyState === WebSocket.OPEN || openaiSocket.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    if (evt.type === "error") {
-      console.error("❌ OpenAI error:", JSON.stringify(evt, null, 2));
-      return;
-    }
+    openaiOpen = false;
+    openaiSocket = new WebSocket(OPENAI_URL, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    });
 
-    if (evt.type === "response.created") responseInFlight = true;
+    openaiSocket.on("open", () => {
+      openaiOpen = true;
+      console.log("✅ OpenAI WS connected");
 
-    if (evt.type === "response.audio.started") {
-      isAISpeaking = true;
-      aiSpeechStartedAt = Date.now();
-    }
+      sendToOpenAI({
+        type: "session.update",
+        session: {
+          modalities: ["audio", "text"],
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          voice: "alloy",
+          temperature: 0.6,
+          instructions: ROY_PROMPT,
+          // keep these on; they should not prevent greeting
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.78,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 800,
+          },
+          input_audio_transcription: { model: "whisper-1" },
+        },
+      });
 
-    if (evt.type === "response.audio.done") {
-      isAISpeaking = false;
-    }
+      flushOpenAIQueue();
 
-    if (evt.type === "response.done") {
-      responseInFlight = false;
-      isAISpeaking = false;
-
-      // Greeting completed → enable barge-in
-      if (greetingInFlight) {
-        greetingInFlight = false;
-        bargeEnabled = true;
-        console.log("✅ Greeting finished → barge-in ENABLED");
+      // If start already happened, issue greeting now
+      if (streamSid && !greetingIssued) {
+        issueGreeting("on_open");
       }
+    });
 
-      // End cancel/hard-mute window cleanly
-      cancelInProgress = false;
-      bargeInProgress = false;
-      energyPacketCount = 0;
-    }
-
-    // Commit on speech stop so transcription completes
-    if (evt.type === "input_audio_buffer.speech_stopped") {
-      sendToOpenAI({ type: "input_audio_buffer.commit" });
-    }
-
-    // Track AI audio output + HARD MUTE while canceling
-    if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
-      lastAiAudioAt = Date.now();
-
-      if (cancelInProgress) {
-        // critical: don't forward post-cancel tail audio
+    openaiSocket.on("message", (raw) => {
+      let evt;
+      try {
+        evt = JSON.parse(raw.toString());
+      } catch {
         return;
       }
 
-      if (twilioSocket.readyState === WebSocket.OPEN) {
-        twilioSocket.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: evt.delta },
-        }));
-      }
-    }
-
-    // Phase 2 decision after transcript
-    if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      const transcript = (evt.transcript || "").trim();
-      if (!transcript) {
-        bargeInProgress = false;
-        cancelInProgress = false;
+      if (evt.type === "error") {
+        console.error("❌ OpenAI error:", JSON.stringify(evt, null, 2));
         return;
       }
 
-      // De-dupe transcript to prevent double answering
-      const now = Date.now();
-      if (transcript === lastTranscript && (now - lastTranscriptAt) < 900) {
-        return;
-      }
-      lastTranscript = transcript;
-      lastTranscriptAt = now;
+      // Helpful debug signals
+      if (evt.type === "response.created") console.log("🟦 OpenAI response.created");
+      if (evt.type === "response.audio.started") console.log("🟩 OpenAI response.audio.started");
+      if (evt.type === "response.audio.done") console.log("🟥 OpenAI response.audio.done");
+      if (evt.type === "response.done") console.log("⬛ OpenAI response.done");
 
-      const filler = isOnlyFillerWords(transcript);
-      const strongQ = isStrongQuestion(transcript);
+      // Stream audio to Twilio
+      if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
+        gotAnyAudioDelta = true;
 
-      // If we barge-canceled Roy, only respond if it's a real question
-      if (bargeInProgress) {
-        bargeInProgress = false;
-        cancelInProgress = false;
-        energyPacketCount = 0;
-
-        if (!filler && strongQ) {
-          injectUserTextAndRespond(transcript);
+        if (twilioSocket.readyState === WebSocket.OPEN) {
+          twilioSocket.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: evt.delta },
+          }));
         }
-        return;
       }
+    });
 
-      // Normal flow when Roy isn't speaking
-      injectUserTextAndRespond(transcript);
-    }
-  });
+    openaiSocket.on("close", (c, r) => {
+      console.error("❌ OpenAI WS closed", c, r ? r.toString() : "");
+      openaiOpen = false;
+      if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
+    });
 
-  openaiSocket.on("close", (c, r) => {
-    console.error("❌ OpenAI WS closed", c, r ? r.toString() : "");
-    if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
-  });
+    openaiSocket.on("error", (e) => {
+      console.error("❌ OpenAI WS error", e);
+    });
+  }
 
-  openaiSocket.on("error", (e) => {
-    console.error("❌ OpenAI WS error", e);
-  });
-
+  // Twilio side
   let trackLogged = false;
-
-  const isCallerAudio = (track) => {
-    if (!track) return false;
-    return track === "inbound" || track === "inbound_track";
-  };
+  const isCallerAudio = (track) => track === "inbound" || track === "inbound_track";
 
   twilioSocket.on("message", (msg) => {
     let data;
@@ -431,19 +248,13 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ FORCE GREETING IMMEDIATELY - turn_detection is NULL so this fires right away
-      greetingInFlight = true;
-      bargeEnabled = false; // lock barge-in during greeting
+      // Connect to OpenAI immediately
+      connectOpenAIIfNeeded();
 
-      sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          turn_detection: null,  // Override session turn detection - speak immediately without waiting for user
-        },
-      });
+      // If OpenAI already open, greet immediately here (your preferred behavior)
+      if (openaiOpen && !greetingIssued) {
+        issueGreeting("on_start");
+      }
 
       return;
     }
@@ -461,51 +272,32 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Phase 1: instant stop based on energy overlap
-      if (bargeEnabled && !bargeInProgress && speakingNow()) {
-        const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
-        if (!grace) {
-          const db = ulawEnergyDb(payload);
-          if (db > ENERGY_THRESHOLD_DB) {
-            energyPacketCount += 1;
-            if (energyPacketCount >= PRE_CANCEL_PACKETS) {
-              bargeInProgress = true;
-              cancelInProgress = true;
-              energyPacketCount = 0;
-              cancelAndClearTwilio();
-              // Phase 2 decides after transcript (filler => ignore, question => answer)
-            }
-          } else {
-            // Don't reset immediately - allow brief pauses
-            if (energyPacketCount > 0) energyPacketCount = Math.max(0, energyPacketCount - 1);
-          }
-        } else {
-          energyPacketCount = 0;
-        }
-      } else {
-        energyPacketCount = 0;
-      }
+      // Ensure OpenAI exists
+      connectOpenAIIfNeeded();
 
-      // Always append audio for transcription
+      // Always forward caller audio (so transcription/turn-detect works later)
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
 
     if (data.event === "stop") {
       console.log("⛔ Twilio stop");
-      if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
+      if (greetingWatchdog) clearTimeout(greetingWatchdog);
+      if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
       if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
     }
   });
 
   twilioSocket.on("close", () => {
     console.log("🔌 Twilio WS closed");
-    if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
+    if (greetingWatchdog) clearTimeout(greetingWatchdog);
+    if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
   });
 
   twilioSocket.on("error", (e) => {
     console.error("❌ Twilio WS error", e);
-    if (openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
+    if (greetingWatchdog) clearTimeout(greetingWatchdog);
+    if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) openaiSocket.close();
   });
 });
 
