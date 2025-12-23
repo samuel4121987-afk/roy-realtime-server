@@ -226,8 +226,8 @@ wss.on("connection", (twilioSocket) => {
 
   // TUNING
   const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 1;    // ~20ms - immediate interruption
-  const BARGE_GRACE_MS = 50;       // reduced from 120ms - faster interruption
+  const PRE_CANCEL_PACKETS = 2;    // ~40ms
+  const BARGE_GRACE_MS = 120;      // after AI audio starts
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -431,25 +431,19 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ FORCE GREETING - inject assistant message then create response
+      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
       greetingInFlight = true;
       bargeEnabled = false; // lock barge-in during greeting
 
-      // First, inject the greeting as an assistant message
       sendToOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "assistant",
-          content: [{ 
-            type: "input_text", 
-            text: "24/7 AI, this is Roy. How can I help you?" 
-          }]
-        }
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          temperature: 0,
+          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
+          commit: true,
+        },
       });
-
-      // Then immediately create a response to speak it
-      sendToOpenAI({ type: "response.create" });
 
       return;
     }
@@ -482,11 +476,8 @@ wss.on("connection", (twilioSocket) => {
               // Phase 2 decides after transcript (filler => ignore, question => answer)
             }
           } else {
-            // Don't reset immediately - allow brief pauses
-            if (energyPacketCount > 0) energyPacketCount = Math.max(0, energyPacketCount - 1);
+            energyPacketCount = 0;
           }
-        } else {
-          energyPacketCount = 0;
         }
       } else {
         energyPacketCount = 0;
