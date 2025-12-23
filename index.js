@@ -291,9 +291,9 @@ wss.on("connection", (twilioSocket) => {
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.78,
+          threshold: 0.85,  // Increased from 0.78 - less sensitive to background noise
           prefix_padding_ms: 300,
-          silence_duration_ms: 800
+          silence_duration_ms: 900  // Increased from 800 - require more silence before detecting speech end
         },
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -492,7 +492,13 @@ wss.on("connection", (twilioSocket) => {
         energyPacketCount = 0;
       }
 
-      // Always append audio for transcription
+      // CRITICAL: Block audio input during greeting to prevent background noise responses
+      if (greetingInFlight) {
+        // Do NOT send any audio to OpenAI during greeting - ignore coughs, background noise, etc.
+        return;
+      }
+
+      // Always append audio for transcription (only after greeting is done)
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
