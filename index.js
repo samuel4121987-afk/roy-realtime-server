@@ -11,11 +11,6 @@ if (!OPENAI_API_KEY) {
 const OPENAI_URL =
   "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-/**
- * NOTE (kept minimal): I removed the “never reveal you are AI / prohibited topics” instruction.
- * You can still say “24/7 AI” as the company name and act like a receptionist,
- * but you can’t hard-instruct deceptive impersonation.
- */
 const ROY_PROMPT = `
 You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
@@ -55,7 +50,40 @@ You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 Always follow these instructions for every call without exception.
 `.trim();
 
-/** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
+/** ---------------- ENERGY DETECTION (Twilio µ-law requires bit-invert) ---------------- **/
+
+const MULAW_DECODE = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  // This table assumes input is already inverted (~byte & 0xFF) before lookup.
+  const sign = (i & 0x80) ? -1 : 1;
+  const exponent = (i >> 4) & 0x07;
+  const mantissa = i & 0x0F;
+  const magnitude = ((mantissa << 3) + 132) << exponent;
+  MULAW_DECODE[i] = sign * (magnitude - 132);
+}
+
+function calculateEnergyDb(base64Payload) {
+  if (!base64Payload) return -100;
+
+  try {
+    const buffer = Buffer.from(base64Payload, "base64");
+    if (!buffer.length) return -100;
+
+    let sumSquares = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      const pcm = MULAW_DECODE[(~buffer[i]) & 0xff]; // CRITICAL: invert byte
+      sumSquares += pcm * pcm;
+    }
+
+    const rms = Math.sqrt(sumSquares / buffer.length);
+    const db = 20 * Math.log10(rms / 32768 + 1e-10);
+    return db;
+  } catch {
+    return -100;
+  }
+}
+
+/** ---------------- filler + question detection ---------------- **/
 
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
@@ -91,9 +119,7 @@ function looksLikeQuestion(text) {
   if (raw.includes("?")) return true;
 
   const w = wordsOf(raw);
-  if (w.length === 0) return false;
-
-  const first = w[0];
+  if (!w.length) return false;
 
   const starters = new Set([
     "who","what","when","where","why","how",
@@ -105,7 +131,7 @@ function looksLikeQuestion(text) {
     "puedo","puede","podría","podria"
   ]);
 
-  if (starters.has(first)) return true;
+  if (starters.has(w[0])) return true;
 
   const lower = raw.toLowerCase();
   const markers = [
@@ -117,7 +143,6 @@ function looksLikeQuestion(text) {
   return markers.some(m => lower.includes(m));
 }
 
-// Important: avoid false cancels from tiny echo fragments like "what", "how"
 function isStrongQuestion(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
@@ -128,44 +153,6 @@ function isStrongQuestion(text) {
 
   if (w.length < 3 && cleanedLen < 12) return false;
   return looksLikeQuestion(raw);
-}
-
-/** ---------------- ELEVENLABS-STYLE: µ-law energy detection (FIXED) ---------------- **/
-
-function ulawByteToPcm16(b) {
-  // Twilio µ-law byte must be inverted
-  let u = (~b) & 0xff;
-
-  const sign = u & 0x80;
-  const exponent = (u >> 4) & 0x07;
-  const mantissa = u & 0x0f;
-
-  let sample = ((mantissa << 3) + 0x84) << exponent;
-  sample -= 0x84;
-
-  return sign ? -sample : sample;
-}
-
-function ulawEnergyDb(base64Payload) {
-  if (!base64Payload) return -100;
-
-  let buf;
-  try {
-    buf = Buffer.from(base64Payload, "base64");
-  } catch {
-    return -100;
-  }
-  if (!buf.length) return -100;
-
-  let sumSq = 0;
-  for (let i = 0; i < buf.length; i++) {
-    const s = ulawByteToPcm16(buf[i]);
-    sumSq += s * s;
-  }
-
-  const rms = Math.sqrt(sumSq / buf.length);
-  const norm = rms / 32768;
-  return 20 * Math.log10(norm + 1e-10);
 }
 
 /** ------------------------------------------------------------------------- **/
@@ -205,29 +192,32 @@ wss.on("connection", (twilioSocket) => {
   let openaiOpen = false;
   const openaiQueue = [];
 
-  // speaking flags
+  // OpenAI speaking state
   let isAISpeaking = false;
   let responseInFlight = false;
 
-  // barge state
-  let bargeEnabled = false;     // 🔒 LOCKED until greeting finishes
-  let greetingInFlight = false; // track the initial greeting response
-  let bargeInProgress = false;  // Phase 1 fired
-  let cancelInProgress = false; // hard mute window
+  // Real outgoing audio activity (critical)
+  let lastAiAudioAt = 0;
+
+  // Greeting lock (critical)
+  let greetingInFlight = false;
+  let bargeEnabled = false;
+
+  // Barge-in phases
+  let bargeInProgress = false;   // Phase 1 fired
+  let cancelInProgress = false;  // hard mute enabled
+  let cancelStartedAt = 0;       // watchdog to unstick
   let energyPacketCount = 0;
 
-  // "real audio activity" tracking
-  let lastAiAudioAt = 0;
-  let aiSpeechStartedAt = 0;
-
-  // Optional: stop double answers if transcript repeats
+  // De-dupe transcripts (prevents double answers)
   let lastTranscript = "";
   let lastTranscriptAt = 0;
 
-  // TUNING
-  const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 2;    // ~40ms
-  const BARGE_GRACE_MS = 120;      // after AI audio starts
+  // Tuning (safe defaults)
+  const ENERGY_THRESHOLD_DB = -50; // if too hard: -55 ; too sensitive: -45
+  const PRE_CANCEL_PACKETS = 2;    // 2 packets ~= 40ms
+  const BARGE_GRACE_MS = 120;      // protect echo during first syllable
+  let aiSpeechStartedAt = 0;
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -266,7 +256,9 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // IMPORTANT: do NOT force isAISpeaking/responseInFlight to false here.
+    cancelInProgress = true;
+    cancelStartedAt = Date.now();
+    // IMPORTANT: do NOT force isAISpeaking/responseInFlight false here.
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -330,14 +322,14 @@ wss.on("connection", (twilioSocket) => {
       responseInFlight = false;
       isAISpeaking = false;
 
-      // Greeting completed → enable barge-in
+      // If this was the greeting, unlock barge-in
       if (greetingInFlight) {
         greetingInFlight = false;
         bargeEnabled = true;
-        console.log("✅ Greeting finished → barge-in ENABLED");
+        console.log("✅ Greeting finished → barge enabled");
       }
 
-      // End cancel/hard-mute window cleanly
+      // End cancel window safely
       cancelInProgress = false;
       bargeInProgress = false;
       energyPacketCount = 0;
@@ -348,14 +340,17 @@ wss.on("connection", (twilioSocket) => {
       sendToOpenAI({ type: "input_audio_buffer.commit" });
     }
 
-    // Track AI audio output + HARD MUTE while canceling
+    // Track AI audio + HARD MUTE while canceling
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       lastAiAudioAt = Date.now();
 
-      if (cancelInProgress) {
-        // critical: don't forward post-cancel tail audio
-        return;
+      // Watchdog: if cancel got stuck, unstick after 1200ms
+      if (cancelInProgress && (Date.now() - cancelStartedAt) > 1200) {
+        cancelInProgress = false;
+        bargeInProgress = false;
       }
+
+      if (cancelInProgress) return;
 
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.send(JSON.stringify({
@@ -366,28 +361,27 @@ wss.on("connection", (twilioSocket) => {
       }
     }
 
-    // Phase 2 decision after transcript
+    // Phase 2: transcript decision
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) {
         bargeInProgress = false;
         cancelInProgress = false;
+        energyPacketCount = 0;
         return;
       }
 
-      // De-dupe transcript to prevent double answering
+      // De-dupe (prevents “answered twice”)
       const now = Date.now();
-      if (transcript === lastTranscript && (now - lastTranscriptAt) < 900) {
-        return;
-      }
+      if (transcript === lastTranscript && (now - lastTranscriptAt) < 900) return;
       lastTranscript = transcript;
       lastTranscriptAt = now;
 
-      const filler = isOnlyFillerWords(transcript);
-      const strongQ = isStrongQuestion(transcript);
-
-      // If we barge-canceled Roy, only respond if it's a real question
+      // If we barged in, only answer real questions (ignore filler/short junk)
       if (bargeInProgress) {
+        const filler = isOnlyFillerWords(transcript);
+        const strongQ = isStrongQuestion(transcript);
+
         bargeInProgress = false;
         cancelInProgress = false;
         energyPacketCount = 0;
@@ -398,7 +392,7 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
-      // Normal flow when Roy isn't speaking
+      // Normal turn (Roy not interrupted)
       injectUserTextAndRespond(transcript);
     }
   });
@@ -431,9 +425,9 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
+      // ✅ PERFECT GREETING LOGIC: DO NOT CHANGE
       greetingInFlight = true;
-      bargeEnabled = false; // lock barge-in during greeting
+      bargeEnabled = false; // lock barge until greeting finishes
 
       sendToOpenAI({
         type: "response.create",
@@ -461,19 +455,18 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Phase 1: instant stop based on energy overlap
+      // Phase 1: immediate stop based on energy (client-side)
       if (bargeEnabled && !bargeInProgress && speakingNow()) {
-        const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
-        if (!grace) {
-          const db = ulawEnergyDb(payload);
+        const graceActive = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
+        if (!graceActive) {
+          const db = calculateEnergyDb(payload);
+
           if (db > ENERGY_THRESHOLD_DB) {
             energyPacketCount += 1;
             if (energyPacketCount >= PRE_CANCEL_PACKETS) {
               bargeInProgress = true;
-              cancelInProgress = true;
               energyPacketCount = 0;
               cancelAndClearTwilio();
-              // Phase 2 decides after transcript (filler => ignore, question => answer)
             }
           } else {
             energyPacketCount = 0;
