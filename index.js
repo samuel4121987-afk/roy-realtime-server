@@ -51,7 +51,7 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start.streamSid;
       console.log("Call started:", streamSid);
 
-      // 🔑 ONLY NOW connect to OpenAI
+      // Connect to OpenAI ONLY after start
       openaiSocket = new WebSocket(OPENAI_URL, {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -62,10 +62,11 @@ wss.on("connection", (twilioSocket) => {
       openaiSocket.on("open", () => {
         console.log("OpenAI connected");
 
+        // Session config
         openaiSocket.send(JSON.stringify({
           type: "session.update",
           session: {
-            modalities: ["audio"],
+            modalities: ["audio", "text"],
             input_audio_format: "g711_ulaw",
             output_audio_format: "g711_ulaw",
             voice: "alloy",
@@ -73,7 +74,19 @@ wss.on("connection", (twilioSocket) => {
           }
         }));
 
-        // 🔊 FORCE GREETING
+        // 🔑 CREATE A USER MESSAGE FIRST
+        openaiSocket.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [
+              { type: "input_text", text: "Please greet the caller now." }
+            ]
+          }
+        }));
+
+        // 🔊 THEN CREATE THE RESPONSE
         openaiSocket.send(JSON.stringify({
           type: "response.create",
           response: {
