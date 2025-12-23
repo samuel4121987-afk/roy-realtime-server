@@ -57,6 +57,7 @@ Always follow these instructions for every call without exception.
 
 /** ---------------- MINIMAL ADD: filler + question detection ---------------- **/
 
+// ✅ REMOVED "espera" from filler, because it means "wait" and should interrupt
 const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
   "aha","yes","yeah","yep","okay","ok","sure","right",
@@ -65,9 +66,25 @@ const FILLER_WORDS = new Set([
   "no","nah"
 ]);
 
-// Words that should STOP Roy immediately (not filler words)
+// ✅ Interrupt commands that SHOULD stop Roy mid-sentence
 const INTERRUPT_WORDS = new Set([
-  "stop","wait","hold","holdon","pause","espera","esperate","para"
+  "stop",
+  "wait",
+  "hold",
+  "holdon",
+  "hold-on",
+  "hold on",
+  "pause",
+  "pausa",
+  "para",
+  "espera",
+  "esperate",
+  "espérate",
+  "esperate un momento",
+  "espérate un momento",
+  "un momento",
+  "momento",
+  "quieto",
 ]);
 
 function normalizeText(t) {
@@ -75,7 +92,8 @@ function normalizeText(t) {
     .toLowerCase()
     .trim()
     .replace(/[“”]/g, '"')
-    .replace(/[.,!?;:()]/g, "");
+    .replace(/[.,!?;:()]/g, "")
+    .replace(/\s+/g, " ");
 }
 
 function wordsOf(t) {
@@ -90,16 +108,36 @@ function isOnlyFillerWords(text) {
   return w.every(x => FILLER_WORDS.has(x));
 }
 
+// Detect interrupt phrases anywhere in transcript
 function hasInterruptWord(text) {
-  const normalized = normalizeText(text);
-  const w = wordsOf(text);
-  
-  // Check individual words
-  if (w.some(word => INTERRUPT_WORDS.has(word))) return true;
-  
-  // Check phrases like "hold on"
-  if (normalized.includes("hold on") || normalized.includes("holdon")) return true;
-  
+  const raw = normalizeText(text);
+  if (!raw) return false;
+
+  // direct phrase checks first (multi-word)
+  const phrases = [
+    "hold on",
+    "hold-on",
+    "esperate un momento",
+    "espérate un momento",
+    "un momento",
+  ];
+  for (const p of phrases) {
+    if (raw.includes(p)) return true;
+  }
+
+  // token checks
+  const w = wordsOf(raw);
+  if (!w.length) return false;
+
+  // "hold" + "on" together
+  for (let i = 0; i < w.length - 1; i++) {
+    if (w[i] === "hold" && w[i + 1] === "on") return true;
+  }
+
+  // any single-token interrupt
+  for (const token of w) {
+    if (INTERRUPT_WORDS.has(token)) return true;
+  }
   return false;
 }
 
@@ -135,7 +173,6 @@ function looksLikeQuestion(text) {
   return markers.some(m => lower.includes(m));
 }
 
-// Important: avoid false cancels from tiny echo fragments like "what", "how"
 function isStrongQuestion(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
@@ -242,10 +279,10 @@ wss.on("connection", (twilioSocket) => {
   let lastTranscript = "";
   let lastTranscriptAt = 0;
 
-  // TUNING - Modified to ignore coughs
-  const ENERGY_THRESHOLD_DB = -45; // Raised from -50 to ignore coughs
-  const PRE_CANCEL_PACKETS = 3;    // Increased from 1 to require ~60ms (avoid cough triggers)
-  const BARGE_GRACE_MS = 50;       // reduced from 120ms - faster interruption
+  // TUNING (updated per your requirements)
+  const ENERGY_THRESHOLD_DB = -45; // ✅ less sensitive -> coughs less likely to trigger
+  const PRE_CANCEL_PACKETS = 3;    // ✅ require ~60ms sustained voice
+  const BARGE_GRACE_MS = 50;       // keep your fast barge-in
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -403,16 +440,23 @@ wss.on("connection", (twilioSocket) => {
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
-      const hasInterrupt = hasInterruptWord(transcript);
+      const interrupt = hasInterruptWord(transcript);
 
-      // If we barge-canceled Roy, only respond if it's a real question or interrupt word
+      // ✅ UPDATED: If we barge-canceled Roy, respond if interrupt OR strong question
       if (bargeInProgress) {
         bargeInProgress = false;
         cancelInProgress = false;
         energyPacketCount = 0;
 
-        // Respond if: it's an interrupt word, OR (not filler AND strong question)
-        if (hasInterrupt || (!filler && strongQ)) {
+        if (filler) return;
+
+        if (interrupt) {
+          // Stop means: acknowledge briefly, then wait for user to continue
+          injectUserTextAndRespond("Okay.");
+          return;
+        }
+
+        if (strongQ) {
           injectUserTextAndRespond(transcript);
         }
         return;
@@ -455,20 +499,18 @@ wss.on("connection", (twilioSocket) => {
       greetingInFlight = true;
       bargeEnabled = false; // lock barge-in during greeting
 
-      // First, inject the greeting as an assistant message
       sendToOpenAI({
         type: "conversation.item.create",
         item: {
           type: "message",
           role: "assistant",
-          content: [{ 
-            type: "input_text", 
-            text: "24/7 AI, this is Roy. How can I help you?" 
+          content: [{
+            type: "input_text",
+            text: "24/7 AI, this is Roy. How can I help you?"
           }]
         }
       });
 
-      // Then immediately create a response to speak it
       sendToOpenAI({ type: "response.create" });
 
       return;
@@ -492,17 +534,19 @@ wss.on("connection", (twilioSocket) => {
         const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
         if (!grace) {
           const db = ulawEnergyDb(payload);
+
           if (db > ENERGY_THRESHOLD_DB) {
             energyPacketCount += 1;
+
             if (energyPacketCount >= PRE_CANCEL_PACKETS) {
               bargeInProgress = true;
               cancelInProgress = true;
               energyPacketCount = 0;
               cancelAndClearTwilio();
-              // Phase 2 decides after transcript (filler => ignore, question => answer)
+              // Phase 2 decides after transcript (filler => ignore, interrupt/strongQ => act)
             }
           } else {
-            // Don't reset immediately - allow brief pauses
+            // decay rather than zeroing immediately (reduces cough jitter)
             if (energyPacketCount > 0) energyPacketCount = Math.max(0, energyPacketCount - 1);
           }
         } else {
