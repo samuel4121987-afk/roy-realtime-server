@@ -61,8 +61,13 @@ const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
   "aha","yes","yeah","yep","okay","ok","sure","right",
   "uh-huh","mm-hmm","mhm","mm","yup",
-  "si","sí","vale","bueno","claro","ya","espera","a","ver",
+  "si","sí","vale","bueno","claro","ya","a","ver",
   "no","nah"
+]);
+
+// Words that should STOP Roy immediately (not filler words)
+const INTERRUPT_WORDS = new Set([
+  "stop","wait","hold","holdon","hold on","pause","espera","esperate","para"
 ]);
 
 function normalizeText(t) {
@@ -83,6 +88,19 @@ function isOnlyFillerWords(text) {
   if (w.length === 0) return true;
   if (w.length > 4) return false;
   return w.every(x => FILLER_WORDS.has(x));
+}
+
+function hasInterruptWord(text) {
+  const normalized = normalizeText(text);
+  const w = wordsOf(text);
+  
+  // Check individual words
+  if (w.some(word => INTERRUPT_WORDS.has(word))) return true;
+  
+  // Check phrases like "hold on"
+  if (normalized.includes("hold on") || normalized.includes("holdon")) return true;
+  
+  return false;
 }
 
 function looksLikeQuestion(text) {
@@ -225,8 +243,8 @@ wss.on("connection", (twilioSocket) => {
   let lastTranscriptAt = 0;
 
   // TUNING
-  const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 2;    // ~40ms
+  const ENERGY_THRESHOLD_DB = -45; // Raised to -45 to ignore coughs (was -50)
+  const PRE_CANCEL_PACKETS = 3;    // Require 3 packets (~60ms) to avoid cough triggers
   const BARGE_GRACE_MS = 120;      // after AI audio starts
 
   function speakingNow() {
@@ -385,14 +403,16 @@ wss.on("connection", (twilioSocket) => {
 
       const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
+      const hasInterrupt = hasInterruptWord(transcript);
 
-      // If we barge-canceled Roy, only respond if it's a real question
+      // If we barge-canceled Roy, only respond if it's a real question or interrupt word
       if (bargeInProgress) {
         bargeInProgress = false;
         cancelInProgress = false;
         energyPacketCount = 0;
 
-        if (!filler && strongQ) {
+        // Respond if: it's an interrupt word, OR (not filler AND strong question)
+        if (hasInterrupt || (!filler && strongQ)) {
           injectUserTextAndRespond(transcript);
         }
         return;
