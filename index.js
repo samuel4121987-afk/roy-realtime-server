@@ -75,7 +75,8 @@ function calculateEnergy(base64Payload) {
     let sumSquares = 0;
     
     for (let i = 0; i < buffer.length; i++) {
-      const pcm = MULAW_DECODE[buffer[i]];
+      // CRITICAL FIX: Bit-invert before decode (Twilio G.711 μ-law requirement)
+      const pcm = MULAW_DECODE[~buffer[i] & 0xFF];
       sumSquares += pcm * pcm;
     }
     
@@ -208,8 +209,9 @@ wss.on("connection", (twilioSocket) => {
   let responseStartedAt = 0;  // Track when response started (for grace period)
   let bargeInProgress = false;  // Phase 1 triggered
   let cancelInProgress = false;  // Hard mute active
-  let energyPacketCount = 0;
-  let isInitialGreeting = true;  // Prevent barge-in during first greeting  // Count consecutive high-energy packets
+  let energyPacketCount = 0;  // Count consecutive high-energy packets
+  let isInitialGreeting = true;  // Prevent barge-in during first greeting
+  let lastTranscript = "";  // Prevent duplicate transcript processing
   
   const ENERGY_THRESHOLD_DB = -45;  // dB threshold for speech detection
   const PRE_CANCEL_PACKETS = 2;  // 2 packets = ~40ms
@@ -247,9 +249,8 @@ wss.on("connection", (twilioSocket) => {
     if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
       twilioSocket.send(JSON.stringify({ event: "clear", streamSid }));
     }
-    // prevent stuck flags
-    isAISpeaking = false;
-    responseInFlight = false;
+    // FIX: DON'T reset isAISpeaking/responseInFlight here - let response.done handle it
+    // This prevents breaking speakingNow detection
   }
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -371,7 +372,20 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
+      // FIX: Prevent duplicate transcript processing
+      if (transcript === lastTranscript) {
+        console.log("🔁 Duplicate transcript ignored:", transcript);
+        return;
+      }
+      lastTranscript = transcript;
+
       console.log("📝 Transcript:", transcript);
+
+      // SKIP processing during initial greeting
+      if (isInitialGreeting) {
+        console.log("🎤 Ignoring transcript during initial greeting:", transcript);
+        return;
+      }
 
       // If we interrupted Roy, decide what to do
       if (bargeInProgress) {
@@ -440,7 +454,21 @@ wss.on("connection", (twilioSocket) => {
     if (data.event === "start") {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
-      // Greeting will be triggered from OpenAI open event
+      
+      // FIX: Send greeting from here (race condition fix)
+      // If OpenAI is already open, send greeting now
+      if (openaiOpen && openaiSocket.readyState === WebSocket.OPEN) {
+        console.log("🎤 Sending greeting (OpenAI already connected)");
+        sendToOpenAI({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Please greet the caller now." }]
+          }
+        });
+        sendToOpenAI({ type: "response.create" });
+      }
       return;
     }
 
