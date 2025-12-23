@@ -21,6 +21,7 @@ function twimlResponse(req) {
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const wsProto = proto === "http" ? "ws" : "wss";
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -40,9 +41,6 @@ wss.on("connection", (twilioSocket) => {
   console.log("✅ Twilio WS connected");
 
   let streamSid = null;
-  let openaiReady = false;
-
-  // 🔒 HARD LOCK
   let greetingInFlight = true;
 
   const openaiSocket = new WebSocket(OPENAI_URL, {
@@ -53,7 +51,6 @@ wss.on("connection", (twilioSocket) => {
   });
 
   openaiSocket.on("open", () => {
-    openaiReady = true;
     console.log("✅ OpenAI WS connected");
 
     openaiSocket.send(JSON.stringify({
@@ -64,7 +61,15 @@ wss.on("connection", (twilioSocket) => {
         output_audio_format: "g711_ulaw",
         voice: "alloy",
         temperature: 0,
-      },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.8,
+          silence_duration_ms: 800
+        },
+        input_audio_transcription: {
+          model: "whisper-1"
+        }
+      }
     }));
   });
 
@@ -72,19 +77,19 @@ wss.on("connection", (twilioSocket) => {
     let evt;
     try { evt = JSON.parse(raw); } catch { return; }
 
-    // Forward audio ONLY
+    // Forward AI audio to Twilio
     if (evt.type === "response.audio.delta" && evt.delta && streamSid) {
       twilioSocket.send(JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload: evt.delta },
+        media: { payload: evt.delta }
       }));
     }
 
-    // 🔓 UNLOCK after greeting
+    // Greeting finished → unlock listening
     if (evt.type === "response.done" && greetingInFlight) {
       greetingInFlight = false;
-      console.log("🔓 Greeting finished — listening enabled");
+      console.log("🔓 Greeting finished — caller can speak now");
     }
   });
 
@@ -96,25 +101,37 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start.streamSid;
       console.log("▶️ Call started:", streamSid);
 
-      // 🔊 FORCE GREETING — NO CONDITIONS
+      // 🔊 FORCE GREETING — ALWAYS
       openaiSocket.send(JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio"],
           instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          commit: true,
-        },
+          commit: true
+        }
       }));
       return;
     }
 
-    // ❌ IGNORE ALL AUDIO UNTIL GREETING IS DONE
-    if (greetingInFlight) return;
+    if (data.event === "media") {
+      const payload = data.media && data.media.payload;
+      if (!payload) return;
 
-    // (We will add listening + interruption AFTER this is confirmed working)
+      // ✅ ALWAYS append audio (even during greeting)
+      openaiSocket.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: payload
+      }));
+    }
+
+    if (data.event === "stop") {
+      console.log("⛔ Call ended");
+      openaiSocket.close();
+    }
   });
 
   twilioSocket.on("close", () => openaiSocket.close());
+  twilioSocket.on("error", () => openaiSocket.close());
 });
 
 const PORT = process.env.PORT || 8080;
