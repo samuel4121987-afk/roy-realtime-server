@@ -67,7 +67,7 @@ const FILLER_WORDS = new Set([
 
 // Words that should STOP Roy immediately (not filler words)
 const INTERRUPT_WORDS = new Set([
-  "stop","wait","hold","holdon","hold on","pause","espera","esperate","para"
+  "stop","wait","hold","holdon","pause","espera","esperate","para"
 ]);
 
 function normalizeText(t) {
@@ -242,10 +242,10 @@ wss.on("connection", (twilioSocket) => {
   let lastTranscript = "";
   let lastTranscriptAt = 0;
 
-  // TUNING
-  const ENERGY_THRESHOLD_DB = -45; // Raised to -45 to ignore coughs (was -50)
-  const PRE_CANCEL_PACKETS = 3;    // Require 3 packets (~60ms) to avoid cough triggers
-  const BARGE_GRACE_MS = 120;      // after AI audio starts
+  // TUNING - Modified to ignore coughs
+  const ENERGY_THRESHOLD_DB = -45; // Raised from -50 to ignore coughs
+  const PRE_CANCEL_PACKETS = 3;    // Increased from 1 to require ~60ms (avoid cough triggers)
+  const BARGE_GRACE_MS = 50;       // reduced from 120ms - faster interruption
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -502,8 +502,11 @@ wss.on("connection", (twilioSocket) => {
               // Phase 2 decides after transcript (filler => ignore, question => answer)
             }
           } else {
-            energyPacketCount = 0;
+            // Don't reset immediately - allow brief pauses
+            if (energyPacketCount > 0) energyPacketCount = Math.max(0, energyPacketCount - 1);
           }
+        } else {
+          energyPacketCount = 0;
         }
       } else {
         energyPacketCount = 0;
