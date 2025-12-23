@@ -226,7 +226,7 @@ wss.on("connection", (twilioSocket) => {
 
   // TUNING
   const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 1;    // ~20ms - immediate interruption on first speech packet
+  const PRE_CANCEL_PACKETS = 1;    // ~20ms - single packet for immediate interruption
   const BARGE_GRACE_MS = 120;      // after AI audio starts
 
   function speakingNow() {
@@ -483,7 +483,13 @@ wss.on("connection", (twilioSocket) => {
         energyPacketCount = 0;
       }
 
-      // Always append audio for transcription
+      // CRITICAL: Block ALL audio input until greeting is complete
+      if (greetingInFlight) {
+        // Do NOT send any audio to OpenAI during greeting - completely ignore caller input
+        return;
+      }
+
+      // Always append audio for transcription (only after greeting is done)
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
