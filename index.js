@@ -232,6 +232,7 @@ wss.on("connection", (twilioSocket) => {
   let bargeInProgress = false;  // Phase 1 fired
   let cancelInProgress = false; // hard mute window
   let energyPacketCount = 0;
+  let recentEnergyLevels = [];  // Track recent energy to detect sustained speech vs bursts
 
   // "real audio activity" tracking
   let lastAiAudioAt = 0;
@@ -243,8 +244,9 @@ wss.on("connection", (twilioSocket) => {
 
   // TUNING
   const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 1;    // ~20ms - immediate interruption
+  const PRE_CANCEL_PACKETS = 3;    // ~60ms - require sustained speech, not just a cough burst
   const BARGE_GRACE_MS = 50;       // reduced from 120ms - faster interruption
+  const ENERGY_SUSTAIN_WINDOW = 5; // Track energy over 5 packets to detect sustained speech vs burst
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -492,29 +494,43 @@ wss.on("connection", (twilioSocket) => {
       const payload = data.media && data.media.payload;
       if (!payload) return;
 
-      // Phase 1: instant stop based on energy overlap
+      // Phase 1: SMART energy detection - distinguish sustained speech from noise bursts
       if (bargeEnabled && !bargeInProgress && speakingNow()) {
         const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
         if (!grace) {
           const db = ulawEnergyDb(payload);
-          if (db > ENERGY_THRESHOLD_DB) {
+          
+          // Track recent energy levels
+          recentEnergyLevels.push(db);
+          if (recentEnergyLevels.length > ENERGY_SUSTAIN_WINDOW) {
+            recentEnergyLevels.shift();
+          }
+          
+          // Count how many recent packets are above threshold
+          const highEnergyCount = recentEnergyLevels.filter(e => e > ENERGY_THRESHOLD_DB).length;
+          
+          // Only trigger if we have SUSTAINED high energy (not just a burst like a cough)
+          if (highEnergyCount >= PRE_CANCEL_PACKETS) {
             energyPacketCount += 1;
             if (energyPacketCount >= PRE_CANCEL_PACKETS) {
               bargeInProgress = true;
               cancelInProgress = true;
               energyPacketCount = 0;
+              recentEnergyLevels = [];
               cancelAndClearTwilio();
               // Phase 2 decides after transcript (filler => ignore, question => answer)
             }
           } else {
-            // Don't reset immediately - allow brief pauses
+            // Not sustained enough - likely just a cough or noise burst
             if (energyPacketCount > 0) energyPacketCount = Math.max(0, energyPacketCount - 1);
           }
         } else {
           energyPacketCount = 0;
+          recentEnergyLevels = [];
         }
       } else {
         energyPacketCount = 0;
+        recentEnergyLevels = [];
       }
 
       // Always append audio for transcription
