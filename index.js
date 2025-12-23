@@ -435,16 +435,18 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Greeting (UNCHANGED)
-      sendToOpenAI({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          temperature: 0,
-          instructions: 'Say EXACTLY: "24/7 AI, this is Roy. How can I help you?"',
-          commit: true,
-        },
-      });
+      // Greeting: inject user message asking Roy to greet
+      if (openaiOpen) {
+        sendToOpenAI({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Please greet the caller now." }]
+          }
+        });
+        sendToOpenAI({ type: "response.create" });
+      }
       return;
     }
 
