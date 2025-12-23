@@ -65,6 +65,23 @@ const FILLER_WORDS = new Set([
   "no","nah"
 ]);
 
+// Background noise patterns that should be completely ignored
+const NOISE_PATTERNS = [
+  "cough", "coughing", "sneeze", "sneezing", "laugh", "laughing",
+  "sigh", "sighing", "clearing", "throat", "ahem", "achoo",
+  "music", "tv", "television", "background", "noise"
+];
+
+function isBackgroundNoise(text) {
+  if (!text) return true;
+  const lower = text.toLowerCase();
+  // Check if transcript is just noise description
+  if (NOISE_PATTERNS.some(pattern => lower.includes(pattern))) return true;
+  // Check if transcript is very short (likely just noise)
+  if (text.trim().length < 3) return true;
+  return false;
+}
+
 function normalizeText(t) {
   return (t || "")
     .toLowerCase()
@@ -291,9 +308,9 @@ wss.on("connection", (twilioSocket) => {
         instructions: ROY_PROMPT,
         turn_detection: {
           type: "server_vad",
-          threshold: 0.85,  // Increased from 0.78 - less sensitive to background noise
+          threshold: 0.78,
           prefix_padding_ms: 300,
-          silence_duration_ms: 900  // Increased from 800 - require more silence before detecting speech end
+          silence_duration_ms: 800
         },
         input_audio_transcription: { model: "whisper-1" },
       },
@@ -370,6 +387,14 @@ wss.on("connection", (twilioSocket) => {
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (evt.transcript || "").trim();
       if (!transcript) {
+        bargeInProgress = false;
+        cancelInProgress = false;
+        return;
+      }
+
+      // CRITICAL: Ignore background noise (coughs, laughs, TV, etc.)
+      if (isBackgroundNoise(transcript)) {
+        console.log("🔇 Ignoring background noise:", transcript);
         bargeInProgress = false;
         cancelInProgress = false;
         return;
@@ -492,13 +517,7 @@ wss.on("connection", (twilioSocket) => {
         energyPacketCount = 0;
       }
 
-      // CRITICAL: Block audio input during greeting to prevent background noise responses
-      if (greetingInFlight) {
-        // Do NOT send any audio to OpenAI during greeting - ignore coughs, background noise, etc.
-        return;
-      }
-
-      // Always append audio for transcription (only after greeting is done)
+      // Always append audio for transcription
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
