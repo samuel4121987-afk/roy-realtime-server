@@ -61,8 +61,14 @@ const FILLER_WORDS = new Set([
   "uh","um","hmm","ah","er","like","you","know",
   "aha","yes","yeah","yep","okay","ok","sure","right",
   "uh-huh","mm-hmm","mhm","mm","yup",
-  "si","sí","vale","bueno","claro","ya","espera","a","ver",
+  "si","sí","vale","bueno","claro","ya","a","ver",
   "no","nah"
+]);
+
+// COMMAND WORDS - these should IMMEDIATELY stop Roy from speaking
+const STOP_COMMANDS = new Set([
+  "wait","stop","hold","pause","hang","hold on","wait a minute","one moment","one second",
+  "espera","para","espérate","esperate","momento","un momento","detente"
 ]);
 
 // Background noise patterns that should be completely ignored
@@ -100,6 +106,18 @@ function isOnlyFillerWords(text) {
   if (w.length === 0) return true;
   if (w.length > 4) return false;
   return w.every(x => FILLER_WORDS.has(x));
+}
+
+function isStopCommand(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase().trim();
+  // Check exact matches
+  if (STOP_COMMANDS.has(lower)) return true;
+  // Check if any stop command is contained in the text
+  for (const cmd of STOP_COMMANDS) {
+    if (lower.includes(cmd)) return true;
+  }
+  return false;
 }
 
 function looksLikeQuestion(text) {
@@ -414,6 +432,28 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
+      // CRITICAL: Check for STOP commands first - these MUST stop Roy immediately
+      const isStop = isStopCommand(transcript);
+      if (isStop) {
+        console.log("⛔ STOP command detected:", transcript);
+        // Force cancel if Roy is speaking
+        if (speakingNow()) {
+          cancelAndClearTwilio();
+        }
+        bargeInProgress = false;
+        cancelInProgress = false;
+        return; // Don't respond, just stop
+      }
+
+      // CRITICAL: Ignore filler words - don't let them stop Roy
+      const filler = isOnlyFillerWords(transcript);
+      if (filler) {
+        console.log("🔇 Ignoring filler words:", transcript);
+        bargeInProgress = false;
+        cancelInProgress = false;
+        return;
+      }
+
       // De-dupe transcript to prevent double answering
       const now = Date.now();
       if (transcript === lastTranscript && (now - lastTranscriptAt) < 900) {
@@ -422,7 +462,6 @@ wss.on("connection", (twilioSocket) => {
       lastTranscript = transcript;
       lastTranscriptAt = now;
 
-      const filler = isOnlyFillerWords(transcript);
       const strongQ = isStrongQuestion(transcript);
 
       // If we barge-canceled Roy, only respond if it's a real question
@@ -431,13 +470,13 @@ wss.on("connection", (twilioSocket) => {
         cancelInProgress = false;
         energyPacketCount = 0;
 
-        if (!filler && strongQ) {
+        if (strongQ) {
           injectUserTextAndRespond(transcript);
         }
         return;
       }
 
-      // Normal flow when Roy isn't speaking
+      // Normal flow when Roy isn't speaking - respond to everything (filler already filtered above)
       injectUserTextAndRespond(transcript);
     }
   });
