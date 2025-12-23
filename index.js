@@ -226,7 +226,7 @@ wss.on("connection", (twilioSocket) => {
 
   // TUNING
   const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 1;    // ~20ms - immediate interruption on first speech
+  const PRE_CANCEL_PACKETS = 2;    // ~40ms
   const BARGE_GRACE_MS = 120;      // after AI audio starts
 
   function speakingNow() {
@@ -330,24 +330,11 @@ wss.on("connection", (twilioSocket) => {
       responseInFlight = false;
       isAISpeaking = false;
 
-      // Greeting completed → RE-ENABLE turn detection and barge-in
+      // Greeting completed → enable barge-in
       if (greetingInFlight) {
         greetingInFlight = false;
         bargeEnabled = true;
-        console.log("✅ Greeting finished → re-enabling turn detection and barge-in");
-        
-        // Turn turn detection back ON after greeting
-        sendToOpenAI({
-          type: "session.update",
-          session: {
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.78,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 800
-            }
-          }
-        });
+        console.log("✅ Greeting finished → barge-in ENABLED");
       }
 
       // End cancel/hard-mute window cleanly
@@ -444,19 +431,10 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // ✅ DISABLE TURN DETECTION FOR GREETING - prevents background noise from interrupting
+      // ✅ KEEP YOUR PERFECT GREETING LOGIC HERE
       greetingInFlight = true;
       bargeEnabled = false; // lock barge-in during greeting
 
-      // Turn OFF server VAD during greeting
-      sendToOpenAI({
-        type: "session.update",
-        session: {
-          turn_detection: null  // Disable turn detection completely during greeting
-        }
-      });
-
-      // Force the greeting immediately
       sendToOpenAI({
         type: "response.create",
         response: {
