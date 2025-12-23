@@ -434,19 +434,7 @@ wss.on("connection", (twilioSocket) => {
     if (data.event === "start") {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
-
-      // Greeting: inject user message asking Roy to greet
-      if (openaiOpen) {
-        sendToOpenAI({
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: "Please greet the caller now." }]
-          }
-        });
-        sendToOpenAI({ type: "response.create" });
-      }
+      // Greeting will be triggered from OpenAI open event
       return;
     }
 
