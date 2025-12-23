@@ -212,6 +212,7 @@ wss.on("connection", (twilioSocket) => {
   // barge state
   let bargeEnabled = false;     // 🔒 LOCKED until greeting finishes
   let greetingInFlight = false; // track the initial greeting response
+  let greetingSent = false;     // track if greeting was already sent
   let bargeInProgress = false;  // Phase 1 fired
   let cancelInProgress = false; // hard mute window
   let energyPacketCount = 0;
@@ -296,8 +297,9 @@ wss.on("connection", (twilioSocket) => {
 
     flushOpenAIQueue();
 
-    // Send greeting immediately after session is configured
-    if (streamSid) {
+    // Send greeting if Twilio already connected
+    if (streamSid && !greetingSent) {
+      greetingSent = true;
       greetingInFlight = true;
       bargeEnabled = false;
       sendToOpenAI({
@@ -443,10 +445,12 @@ wss.on("connection", (twilioSocket) => {
       streamSid = data.start && data.start.streamSid ? data.start.streamSid : null;
       console.log("▶️ Twilio start:", streamSid);
 
-      // Trigger greeting if OpenAI is already connected
-      if (openaiOpen && openaiSocket.readyState === WebSocket.OPEN) {
+      // Trigger greeting immediately if OpenAI is ready
+      if (openaiOpen && openaiSocket.readyState === WebSocket.OPEN && !greetingSent) {
+        greetingSent = true;
         greetingInFlight = true;
         bargeEnabled = false;
+        console.log("👋 Sending greeting now...");
         sendToOpenAI({
           type: "response.create",
           response: {
