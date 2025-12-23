@@ -241,6 +241,9 @@ wss.on("connection", (twilioSocket) => {
   // Optional: stop double answers if transcript repeats
   let lastTranscript = "";
   let lastTranscriptAt = 0;
+  
+  // Track if recent audio was likely a noise burst (cough, etc.)
+  let lastNoiseDetectedAt = 0;
 
   // TUNING
   const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
@@ -394,6 +397,15 @@ wss.on("connection", (twilioSocket) => {
         return;
       }
 
+      // CRITICAL: Ignore transcripts that came right after a noise burst
+      const timeSinceNoise = Date.now() - lastNoiseDetectedAt;
+      if (timeSinceNoise < 1500) {
+        console.log("🔇 Ignoring transcript from noise burst:", transcript);
+        bargeInProgress = false;
+        cancelInProgress = false;
+        return;
+      }
+
       // CRITICAL: Ignore background noise (coughs, laughs, TV, etc.)
       if (isBackgroundNoise(transcript)) {
         console.log("🔇 Ignoring background noise:", transcript);
@@ -495,20 +507,25 @@ wss.on("connection", (twilioSocket) => {
       if (!payload) return;
 
       // Phase 1: SMART energy detection - distinguish sustained speech from noise bursts
+      const db = ulawEnergyDb(payload);
+      
+      // Track recent energy levels (always, not just during barge)
+      recentEnergyLevels.push(db);
+      if (recentEnergyLevels.length > ENERGY_SUSTAIN_WINDOW) {
+        recentEnergyLevels.shift();
+      }
+      
+      // Detect noise bursts (high energy but not sustained)
+      const highEnergyCount = recentEnergyLevels.filter(e => e > ENERGY_THRESHOLD_DB).length;
+      if (db > ENERGY_THRESHOLD_DB && highEnergyCount < 2) {
+        // Single high energy spike = likely cough/noise, not speech
+        lastNoiseDetectedAt = Date.now();
+        console.log("🔊 Noise burst detected (likely cough/background)");
+      }
+      
       if (bargeEnabled && !bargeInProgress && speakingNow()) {
         const grace = aiSpeechStartedAt && (Date.now() - aiSpeechStartedAt) < BARGE_GRACE_MS;
         if (!grace) {
-          const db = ulawEnergyDb(payload);
-          
-          // Track recent energy levels
-          recentEnergyLevels.push(db);
-          if (recentEnergyLevels.length > ENERGY_SUSTAIN_WINDOW) {
-            recentEnergyLevels.shift();
-          }
-          
-          // Count how many recent packets are above threshold
-          const highEnergyCount = recentEnergyLevels.filter(e => e > ENERGY_THRESHOLD_DB).length;
-          
           // Only trigger if we have SUSTAINED high energy (not just a burst like a cough)
           if (highEnergyCount >= PRE_CANCEL_PACKETS) {
             energyPacketCount += 1;
