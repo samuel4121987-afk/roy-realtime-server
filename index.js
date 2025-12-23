@@ -111,12 +111,19 @@ function isOnlyFillerWords(text) {
 function isStopCommand(text) {
   if (!text) return false;
   const lower = text.toLowerCase().trim();
-  // Check exact matches
+  const words = wordsOf(lower);
+  
+  // Only trigger if the ENTIRE transcript is a stop command or starts with one
+  // This prevents "explain more" from triggering "para" in Spanish
   if (STOP_COMMANDS.has(lower)) return true;
-  // Check if any stop command is contained in the text
-  for (const cmd of STOP_COMMANDS) {
-    if (lower.includes(cmd)) return true;
-  }
+  
+  // Check if first word is a stop command
+  if (words.length > 0 && STOP_COMMANDS.has(words[0])) return true;
+  
+  // Check for multi-word stop commands at the start
+  const twoWords = words.slice(0, 2).join(" ");
+  if (STOP_COMMANDS.has(twoWords)) return true;
+  
   return false;
 }
 
@@ -153,16 +160,20 @@ function looksLikeQuestion(text) {
 }
 
 // Important: avoid false cancels from tiny echo fragments like "what", "how"
+// But don't be TOO strict - let the AI handle most cases
 function isStrongQuestion(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
-  if (raw.includes("?")) return true;
-
+  
   const w = wordsOf(raw);
-  const cleanedLen = normalizeText(raw).replace(/\s+/g, " ").length;
-
-  if (w.length < 3 && cleanedLen < 12) return false;
-  return looksLikeQuestion(raw);
+  
+  // Only filter out VERY short single-word fragments that are likely echoes
+  // Examples: "what", "how", "huh" by themselves
+  if (w.length === 1 && raw.length < 5) return false;
+  
+  // Everything else (2+ words or longer single words) should be treated as valid
+  // Let the AI decide if it's worth responding to
+  return true;
 }
 
 /** ---------------- ELEVENLABS-STYLE: µ-law energy detection (FIXED) ---------------- **/
@@ -265,9 +276,9 @@ wss.on("connection", (twilioSocket) => {
 
   // TUNING
   const ENERGY_THRESHOLD_DB = -50; // if too hard: -55; if too sensitive: -45
-  const PRE_CANCEL_PACKETS = 3;    // ~60ms - require sustained speech, not just a cough burst
-  const BARGE_GRACE_MS = 50;       // reduced from 120ms - faster interruption
-  const ENERGY_SUSTAIN_WINDOW = 5; // Track energy over 5 packets to detect sustained speech vs burst
+  const PRE_CANCEL_PACKETS = 2;    // ~40ms - balanced for quick interruption without false triggers
+  const BARGE_GRACE_MS = 100;      // grace period after Roy starts speaking
+  const ENERGY_SUSTAIN_WINDOW = 4; // Track energy over 4 packets to detect sustained speech vs burst
 
   function speakingNow() {
     const elapsed = lastAiAudioAt ? (Date.now() - lastAiAudioAt) : 999999;
@@ -289,16 +300,25 @@ wss.on("connection", (twilioSocket) => {
     }
   }
 
-  function injectUserTextAndRespond(text) {
-    sendToOpenAI({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text }]
-      }
-    });
-    sendToOpenAI({ type: "response.create" });
+  function injectUserTextAndRespond(text, afterCancel = false) {
+    const createItem = () => {
+      sendToOpenAI({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text }]
+        }
+      });
+      sendToOpenAI({ type: "response.create" });
+    };
+    
+    // If this is right after a cancel, give it a tiny moment to settle
+    if (afterCancel) {
+      setTimeout(createItem, 50);
+    } else {
+      createItem();
+    }
   }
 
   function cancelAndClearTwilio() {
@@ -462,22 +482,22 @@ wss.on("connection", (twilioSocket) => {
       lastTranscript = transcript;
       lastTranscriptAt = now;
 
-      const strongQ = isStrongQuestion(transcript);
-
-      // If we barge-canceled Roy, only respond if it's a real question
+      // If we barge-canceled Roy, respond to the user's input
+      // (filler words already filtered above, so anything here is real speech)
       if (bargeInProgress) {
         bargeInProgress = false;
         cancelInProgress = false;
         energyPacketCount = 0;
-
-        if (strongQ) {
-          injectUserTextAndRespond(transcript);
-        }
+        recentEnergyLevels = [];
+        
+        console.log("✅ Responding to interruption:", transcript);
+        injectUserTextAndRespond(transcript, true); // afterCancel = true
         return;
       }
 
       // Normal flow when Roy isn't speaking - respond to everything (filler already filtered above)
-      injectUserTextAndRespond(transcript);
+      console.log("✅ Normal response to:", transcript);
+      injectUserTextAndRespond(transcript, false);
     }
   });
 
