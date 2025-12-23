@@ -213,9 +213,9 @@ wss.on("connection", (twilioSocket) => {
   let isInitialGreeting = true;  // Prevent barge-in during first greeting
   let lastTranscript = "";  // Prevent duplicate transcript processing
   
-  const ENERGY_THRESHOLD_DB = -45;  // dB threshold for speech detection
-  const PRE_CANCEL_PACKETS = 2;  // 2 packets = ~40ms
-  const BARGE_GRACE_MS = 100;  // Wait 100ms after Roy starts speaking
+  const ENERGY_THRESHOLD_DB = -50;  // LOWER = more sensitive (was -45)
+  const PRE_CANCEL_PACKETS = 1;  // INSTANT cancel on first packet (was 2)
+  const BARGE_GRACE_MS = 0;  // NO grace period = interrupt immediately (was 100)
 
   function sendToOpenAI(obj) {
     const msg = JSON.stringify(obj);
@@ -490,14 +490,14 @@ wss.on("connection", (twilioSocket) => {
       
       // Check if Roy is REALLY speaking (not just responseInFlight)
       const elapsedSinceAudio = lastAiAudioAt > 0 ? Date.now() - lastAiAudioAt : 999999;
-      const speakingNow = isAISpeaking || responseInFlight || elapsedSinceAudio < 350;
+      const speakingNow = isAISpeaking || responseInFlight || elapsedSinceAudio < 500;  // Increased window
       
       // Grace period: don't interrupt immediately when Roy starts
       const gracePeriodActive = responseStartedAt > 0 && (Date.now() - responseStartedAt) < BARGE_GRACE_MS;
 
       // DEBUG LOGGING - show when energy is detected
       if (energy > -60) {
-        console.log(`🎤 Energy: ${energy.toFixed(1)}dB | Speaking: ${speakingNow} | Grace: ${gracePeriodActive} | InitGreet: ${isInitialGreeting} | BargeIP: ${bargeInProgress} | Count: ${energyPacketCount}`);
+        console.log(`🎤 Energy: ${energy.toFixed(1)}dB | Speaking: ${speakingNow} | Grace: ${gracePeriodActive} | InitGreet: ${isInitialGreeting} | BargeIP: ${bargeInProgress} | Count: ${energyPacketCount} | Elapsed: ${elapsedSinceAudio}ms`);
       }
 
       // PHASE 1: IMMEDIATE STOP (don't wait for OpenAI VAD!)
@@ -507,11 +507,13 @@ wss.on("connection", (twilioSocket) => {
         
         if (energyPacketCount >= PRE_CANCEL_PACKETS) {
           // CANCEL IMMEDIATELY
+          console.log("⚡⚡⚡ BARGE-IN TRIGGERED! Canceling Roy NOW!");
           bargeInProgress = true;
           cancelInProgress = true;
           energyPacketCount = 0;
           
           cancelAndClearTwilio();
+          console.log("🛑 Waiting for transcript to decide next action...");
           // Wait for transcript to decide if filler or real question
         }
       } else if (energy <= ENERGY_THRESHOLD_DB) {
