@@ -9,8 +9,8 @@ if (!OPENAI_API_KEY) {
 
 const ROY_PROMPT = `You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
-You MUST follow these rules:
-- Keep ALL responses very short (1-2 sentences maximum)
+IMPORTANT: Keep ALL responses very short (1-2 sentences maximum). Be conversational and natural.
+
 - Use contractions (I'm, we'll, don't)
 - Be casual, friendly, and confident
 - Never be robotic or overly formal
@@ -37,19 +37,17 @@ app.post("/incoming-call", (req, res) => {
   const callSid = req.body.CallSid;
   console.log("📞 Incoming call:", callSid);
 
-  // Initialize conversation with greeting
+  // Initialize conversation with system prompt
   conversations.set(callSid, [
-    { role: "system", content: ROY_PROMPT },
-    { role: "assistant", content: "24/7 AI, this is Roy. How can I help you?" }
+    { role: "system", content: ROY_PROMPT }
   ]);
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Google.en-US-Neural2-D">24/7 AI, this is Roy. How can I help you?</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
-    <Pause length="10"/>
+  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+    <Pause length="60"/>
   </Gather>
-  <Redirect>/handle-speech</Redirect>
 </Response>`;
 
   res.type("text/xml").send(twiml);
@@ -67,12 +65,11 @@ app.post("/handle-speech", async (req, res) => {
   ];
 
   if (!speechResult || speechResult.trim() === "") {
-    // No speech detected - ask again
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Google.en-US-Neural2-D">I'm sorry, I didn't catch that. Could you repeat?</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
-    <Pause length="10"/>
+  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+    <Pause length="60"/>
   </Gather>
   <Say voice="Google.en-US-Neural2-D">Thank you for calling. Goodbye.</Say>
   <Hangup/>
@@ -81,17 +78,15 @@ app.post("/handle-speech", async (req, res) => {
   }
 
   // Check for filler words - ignore them
-  const fillerWords = ["yeah", "yep", "okay", "ok", "uh-huh", "mm-hmm", "sure", "right"];
+  const fillerWords = ["yeah", "yep", "okay", "ok", "uh-huh", "mm-hmm", "sure", "right", "uh", "um"];
   const isFillerOnly = fillerWords.includes(speechResult.toLowerCase().trim());
 
   if (isFillerOnly) {
-    // Ignore filler, continue listening
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
-    <Pause length="10"/>
+  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+    <Pause length="60"/>
   </Gather>
-  <Redirect>/handle-speech</Redirect>
 </Response>`;
     return res.type("text/xml").send(twiml);
   }
@@ -107,7 +102,7 @@ app.post("/handle-speech", async (req, res) => {
         model: "gpt-4",
         messages: conversation,
         temperature: 0.7,
-        max_tokens: 150 // Keep responses short
+        max_tokens: 100
       },
       {
         headers: {
@@ -128,21 +123,28 @@ app.post("/handle-speech", async (req, res) => {
     const endPhrases = ["goodbye", "bye", "thank you for calling", "have a great day"];
     const shouldEnd = endPhrases.some(phrase => aiResponse.toLowerCase().includes(phrase));
 
+    // Escape XML special characters
+    const escapedResponse = aiResponse
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+
     let twiml;
     if (shouldEnd) {
       twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Neural2-D">${aiResponse}</Say>
+  <Say voice="Google.en-US-Neural2-D">${escapedResponse}</Say>
   <Hangup/>
 </Response>`;
     } else {
       twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Neural2-D">${aiResponse}</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
-    <Pause length="10"/>
+  <Say voice="Google.en-US-Neural2-D">${escapedResponse}</Say>
+  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+    <Pause length="60"/>
   </Gather>
-  <Redirect>/handle-speech</Redirect>
 </Response>`;
     }
 
@@ -163,10 +165,12 @@ app.post("/handle-speech", async (req, res) => {
 // Cleanup old conversations (prevent memory leak)
 setInterval(() => {
   const now = Date.now();
+  const oneHourAgo = now - 3600000;
   for (const [callSid, conversation] of conversations.entries()) {
-    // Remove conversations older than 1 hour
-    if (now - conversation.timestamp > 3600000) {
+    // Remove conversations older than 1 hour (simple cleanup)
+    if (conversations.size > 100) {
       conversations.delete(callSid);
+      break;
     }
   }
 }, 300000); // Check every 5 minutes
