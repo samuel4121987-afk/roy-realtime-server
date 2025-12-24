@@ -45,7 +45,7 @@ app.post("/incoming-call", (req, res) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">24/7 AI, this is Roy. How can I help you?</Say>
+  <Say voice="Google.en-US-Neural2-D">24/7 AI, this is Roy. How can I help you?</Say>
   <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
     <Pause length="10"/>
   </Gather>
@@ -70,11 +70,11 @@ app.post("/handle-speech", async (req, res) => {
     // No speech detected - ask again
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">I'm sorry, I didn't catch that. Could you repeat?</Say>
+  <Say voice="Google.en-US-Neural2-D">I'm sorry, I didn't catch that. Could you repeat?</Say>
   <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
     <Pause length="10"/>
   </Gather>
-  <Say voice="Polly.Matthew">Thank you for calling. Goodbye.</Say>
+  <Say voice="Google.en-US-Neural2-D">Thank you for calling. Goodbye.</Say>
   <Hangup/>
 </Response>`;
     return res.type("text/xml").send(twiml);
@@ -132,13 +132,13 @@ app.post("/handle-speech", async (req, res) => {
     if (shouldEnd) {
       twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">${aiResponse}</Say>
+  <Say voice="Google.en-US-Neural2-D">${aiResponse}</Say>
   <Hangup/>
 </Response>`;
     } else {
       twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">${aiResponse}</Say>
+  <Say voice="Google.en-US-Neural2-D">${aiResponse}</Say>
   <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true">
     <Pause length="10"/>
   </Gather>
@@ -153,7 +153,7 @@ app.post("/handle-speech", async (req, res) => {
     
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">I'm sorry, I'm having technical difficulties. Please call back later.</Say>
+  <Say voice="Google.en-US-Neural2-D">I'm sorry, I'm having technical difficulties. Please call back later.</Say>
   <Hangup/>
 </Response>`;
     res.type("text/xml").send(twiml);
