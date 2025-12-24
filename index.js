@@ -1,4 +1,4 @@
-Replace the entire index.js NOW with the GPT-4 stable version (this will break your current system until you test it)const express = require("express");
+const express = require("express");
 const axios = require("axios");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
