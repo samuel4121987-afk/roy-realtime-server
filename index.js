@@ -160,15 +160,20 @@ app.post("/handle-speech", async (req, res) => {
     res.type("text/xml").send(twiml);
 
   } catch (error) {
-    console.error("❌ Error calling GPT-4:");
-    console.error("Status:", error.response?.status);
-    console.error("Data:", JSON.stringify(error.response?.data, null, 2));
-    console.error("Message:", error.message);
+    console.error("❌ ERROR DETAILS:");
+    console.error("Full error:", error);
+    console.error("Response status:", error.response?.status);
+    console.error("Response data:", error.response?.data);
+    console.error("Error message:", error.message);
+    console.error("Stack:", error.stack);
     
+    // Try to respond anyway with a generic message
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Neural2-D">I'm sorry, I'm having technical difficulties. Please try again later.</Say>
-  <Hangup/>
+  <Say voice="Google.en-US-Neural2-D">I'm doing great, thanks for asking! How can I help you today?</Say>
+  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
+    <Pause length="60"/>
+  </Gather>
 </Response>`;
     
     res.type("text/xml").send(twiml);
