@@ -105,13 +105,15 @@ app.post("/handle-speech", async (req, res) => {
     conversation.push({ role: "user", content: speechResult });
 
     // Call GPT-4 stable API
+    console.log("📤 Calling GPT-4 with", conversation.length, "messages");
+    
     const response = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
-        model: "gpt-4",
+        model: "gpt-4o",
         messages: conversation,
-        temperature: 0.7,
-        max_tokens: 100
+        temperature: 0.6,
+        max_tokens: 150
       },
       {
         headers: {
@@ -158,7 +160,10 @@ app.post("/handle-speech", async (req, res) => {
     res.type("text/xml").send(twiml);
 
   } catch (error) {
-    console.error("❌ Error calling GPT-4:", error.response?.data || error.message);
+    console.error("❌ Error calling GPT-4:");
+    console.error("Status:", error.response?.status);
+    console.error("Data:", JSON.stringify(error.response?.data, null, 2));
+    console.error("Message:", error.message);
     
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
