@@ -9,6 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0",
+        "@deepgram/sdk": "^3.4.0",
     "axios": "^1.6.0"
   }
 }
