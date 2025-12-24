@@ -242,6 +242,7 @@ wss.on("connection", (ws) => {
 // Convert text to speech and stream to Twilio
 async function streamToTwilio(text, ws, streamSid) {
   try {
+    // Request µ-law format directly from ElevenLabs
     const response = await axios.post(
       "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB/stream",
       {
@@ -250,7 +251,8 @@ async function streamToTwilio(text, ws, streamSid) {
         voice_settings: {
           stability: 0.5,
           similarity_boost: 0.75
-        }
+        },
+        output_format: "ulaw_8000"
       },
       {
         headers: {
@@ -261,7 +263,7 @@ async function streamToTwilio(text, ws, streamSid) {
       }
     );
 
-    // Stream audio back to Twilio
+    // Stream audio back to Twilio in µ-law format
     response.data.on("data", (chunk) => {
       const audioBase64 = chunk.toString("base64");
       ws.send(JSON.stringify({
@@ -273,8 +275,12 @@ async function streamToTwilio(text, ws, streamSid) {
       }));
     });
 
+    response.data.on("error", (err) => {
+      console.error("❌ ElevenLabs stream error:", err);
+    });
+
   } catch (error) {
-    console.error("❌ ElevenLabs error:", error.message);
+    console.error("❌ ElevenLabs error:", error.response?.data || error.message);
   }
 }
 
