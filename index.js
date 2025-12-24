@@ -117,8 +117,10 @@ wss.on("connection", (ws) => {
           vad_events: true
         });
 
-        // Send ElevenLabs greeting immediately
-        await streamToTwilio("24/7 AI, this is Roy. How can I help you?", ws, streamSid);
+        // Send ElevenLabs greeting after a short delay to ensure stream is ready
+        setTimeout(async () => {
+          await streamToTwilio("24/7 AI, this is Roy. How can I help you?", ws, streamSid);
+        }, 500);
 
         // Handle Deepgram transcription
         deepgramLive.on(LiveTranscriptionEvents.Transcript, async (data) => {
