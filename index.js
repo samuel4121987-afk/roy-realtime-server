@@ -75,10 +75,9 @@ app.post("/incoming-call", (req, res) => {
     isSpeaking: false
   });
 
-  // TwiML response with Media Streams
+  // TwiML response with Media Streams - NO robotic greeting, go straight to stream
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Neural2-D">24/7 AI, this is Roy. How can I help you?</Say>
   <Connect>
     <Stream url="wss://${req.headers.host}/media-stream" />
   </Connect>
@@ -117,6 +116,9 @@ wss.on("connection", (ws) => {
           utterance_end_ms: 1000,
           vad_events: true
         });
+
+        // Send ElevenLabs greeting immediately
+        await streamToTwilio("24/7 AI, this is Roy. How can I help you?", ws, streamSid);
 
         // Handle Deepgram transcription
         deepgramLive.on(LiveTranscriptionEvents.Transcript, async (data) => {
