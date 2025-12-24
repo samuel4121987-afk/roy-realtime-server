@@ -1,12 +1,20 @@
 const express = require("express");
+const WebSocket = require("ws");
+const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const axios = require("axios");
+const { Readable } = require("stream");
 
+// Environment variables
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY");
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+
+if (!OPENAI_API_KEY || !DEEPGRAM_API_KEY || !ELEVENLABS_API_KEY) {
+  console.error("❌ Missing required API keys");
   process.exit(1);
 }
 
+// Roy's personality prompt
 const ROY_PROMPT = `
 You are Roy, a male voice receptionist for the 24/7 AI Assistant service.
 
@@ -47,138 +55,238 @@ Always follow these instructions for every call without exception.
 `.trim();
 
 const app = express();
-app.set("trust proxy", 1);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-// Store conversations in memory (in production, use Redis or database)
-const conversations = new Map();
+// Store active calls
+const activeCalls = new Map();
 
-function getConversation(callSid) {
-  if (!conversations.has(callSid)) {
-    conversations.set(callSid, [
-      { role: "system", content: ROY_PROMPT }
-    ]);
-  }
-  return conversations.get(callSid);
-}
-
+// Incoming call endpoint
 app.post("/incoming-call", (req, res) => {
   const callSid = req.body.CallSid;
   console.log("📞 Incoming call:", callSid);
 
+  // Initialize call state
+  activeCalls.set(callSid, {
+    conversation: [{ role: "system", content: ROY_PROMPT }],
+    transcript: "",
+    isSpeaking: false
+  });
+
+  // TwiML response with Media Streams
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Google.en-US-Neural2-D">24/7 AI, this is Roy. How can I help you?</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
-    <Pause length="60"/>
-  </Gather>
+  <Connect>
+    <Stream url="wss://${req.headers.host}/media-stream" />
+  </Connect>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-app.post("/handle-speech", async (req, res) => {
-  const callSid = req.body.CallSid;
-  const speechResult = req.body.SpeechResult;
+// WebSocket server for media streams
+const wss = new WebSocket.Server({ noServer: true });
 
-  console.log("🗣️ Speech from", callSid, ":", speechResult);
+wss.on("connection", (ws) => {
+  console.log("🔌 WebSocket connected");
+  
+  let callSid = null;
+  let streamSid = null;
+  let deepgramLive = null;
+  let deepgramClient = null;
 
-  if (!speechResult || speechResult.trim() === "") {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Google.en-US-Neural2-D">I'm sorry, I didn't catch that. Could you repeat?</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
-    <Pause length="60"/>
-  </Gather>
-</Response>`;
-    return res.type("text/xml").send(twiml);
-  }
+  ws.on("message", async (message) => {
+    try {
+      const msg = JSON.parse(message);
 
+      if (msg.event === "start") {
+        callSid = msg.start.callSid;
+        streamSid = msg.start.streamSid;
+        console.log("🎙️ Stream started:", streamSid);
+
+        // Initialize Deepgram
+        deepgramClient = createClient(DEEPGRAM_API_KEY);
+        deepgramLive = deepgramClient.listen.live({
+          model: "nova-2",
+          language: "en-US",
+          smart_format: true,
+          interim_results: false,
+          utterance_end_ms: 1000,
+          vad_events: true
+        });
+
+        // Handle Deepgram transcription
+        deepgramLive.on(LiveTranscriptionEvents.Transcript, async (data) => {
+          const transcript = data.channel.alternatives[0].transcript;
+          
+          if (transcript && transcript.trim() !== "") {
+            console.log("🗣️ Caller said:", transcript);
+            
+            const callState = activeCalls.get(callSid);
+            if (!callState) return;
+
+            // Add user message to conversation
+            callState.conversation.push({ role: "user", content: transcript });
+
+            // Get GPT-4 response (streaming)
+            try {
+              const response = await axios.post(
+                "https://api.openai.com/v1/chat/completions",
+                {
+                  model: "gpt-4o",
+                  messages: callState.conversation,
+                  temperature: 0.6,
+                  max_tokens: 150,
+                  stream: true
+                },
+                {
+                  headers: {
+                    "Authorization": `Bearer ${OPENAI_API_KEY}`,
+                    "Content-Type": "application/json"
+                  },
+                  responseType: "stream"
+                }
+              );
+
+              let fullResponse = "";
+              let currentSentence = "";
+
+              // Process streaming response
+              response.data.on("data", async (chunk) => {
+                const lines = chunk.toString().split("\n").filter(line => line.trim() !== "");
+                
+                for (const line of lines) {
+                  if (line.includes("[DONE]")) continue;
+                  if (!line.startsWith("data: ")) continue;
+                  
+                  try {
+                    const json = JSON.parse(line.substring(6));
+                    const content = json.choices[0]?.delta?.content;
+                    
+                    if (content) {
+                      fullResponse += content;
+                      currentSentence += content;
+
+                      // When we have a complete sentence, convert to speech
+                      if (content.match(/[.!?]\s*$/)) {
+                        const sentence = currentSentence.trim();
+                        if (sentence) {
+                          console.log("🤖 Roy says:", sentence);
+                          await streamToTwilio(sentence, ws, streamSid);
+                          currentSentence = "";
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    // Skip invalid JSON
+                  }
+                }
+              });
+
+              response.data.on("end", async () => {
+                // Send any remaining text
+                if (currentSentence.trim()) {
+                  console.log("🤖 Roy says:", currentSentence.trim());
+                  await streamToTwilio(currentSentence.trim(), ws, streamSid);
+                }
+
+                // Add assistant response to conversation
+                callState.conversation.push({ role: "assistant", content: fullResponse });
+              });
+
+            } catch (error) {
+              console.error("❌ GPT-4 error:", error.message);
+            }
+          }
+        });
+
+        deepgramLive.on(LiveTranscriptionEvents.Error, (error) => {
+          console.error("❌ Deepgram error:", error);
+        });
+
+      } else if (msg.event === "media") {
+        // Forward audio to Deepgram
+        if (deepgramLive && msg.media.payload) {
+          const audioBuffer = Buffer.from(msg.media.payload, "base64");
+          deepgramLive.send(audioBuffer);
+        }
+
+      } else if (msg.event === "stop") {
+        console.log("📴 Stream stopped");
+        if (deepgramLive) {
+          deepgramLive.finish();
+        }
+        activeCalls.delete(callSid);
+      }
+
+    } catch (error) {
+      console.error("❌ WebSocket message error:", error);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("🔌 WebSocket closed");
+    if (deepgramLive) {
+      deepgramLive.finish();
+    }
+  });
+});
+
+// Convert text to speech and stream to Twilio
+async function streamToTwilio(text, ws, streamSid) {
   try {
-    // Get conversation history
-    const conversation = getConversation(callSid);
-    
-    // Add user message
-    conversation.push({ role: "user", content: speechResult });
-
-    // Call GPT-4 stable API
-    console.log("📤 Calling GPT-4 with", conversation.length, "messages");
-    
     const response = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
+      "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB/stream",
       {
-        model: "gpt-4o",
-        messages: conversation,
-        temperature: 0.6,
-        max_tokens: 150
+        text: text,
+        model_id: "eleven_turbo_v2",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75
+        }
       },
       {
         headers: {
-          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+          "xi-api-key": ELEVENLABS_API_KEY,
           "Content-Type": "application/json"
-        }
+        },
+        responseType: "stream"
       }
     );
 
-    const aiResponse = response.data.choices[0].message.content;
-    console.log("🤖 Roy responds:", aiResponse);
-
-    // Add assistant response to conversation
-    conversation.push({ role: "assistant", content: aiResponse });
-
-    // Only end if caller explicitly wants to hang up - don't auto-detect
-    const shouldEnd = false; // Let the conversation continue naturally
-
-    // Escape XML special characters
-    const escapedResponse = aiResponse
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&apos;');
-
-    let twiml;
-    if (shouldEnd) {
-      twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Google.en-US-Neural2-D">${escapedResponse}</Say>
-  <Hangup/>
-</Response>`;
-    } else {
-      twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Google.en-US-Neural2-D">${escapedResponse}</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
-    <Pause length="60"/>
-  </Gather>
-</Response>`;
-    }
-
-    res.type("text/xml").send(twiml);
+    // Stream audio back to Twilio
+    response.data.on("data", (chunk) => {
+      const audioBase64 = chunk.toString("base64");
+      ws.send(JSON.stringify({
+        event: "media",
+        streamSid: streamSid,
+        media: {
+          payload: audioBase64
+        }
+      }));
+    });
 
   } catch (error) {
-    console.error("❌ ERROR DETAILS:");
-    console.error("Full error:", error);
-    console.error("Response status:", error.response?.status);
-    console.error("Response data:", error.response?.data);
-    console.error("Error message:", error.message);
-    console.error("Stack:", error.stack);
-    
-    // Try to respond anyway with a generic message
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Google.en-US-Neural2-D">I'm doing great, thanks for asking! How can I help you today?</Say>
-  <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" speechModel="phone_call" enhanced="true">
-    <Pause length="60"/>
-  </Gather>
-</Response>`;
-    
-    res.type("text/xml").send(twiml);
+    console.error("❌ ElevenLabs error:", error.message);
   }
+}
+
+// Start server
+const PORT = Number(process.env.PORT || 8080);
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log("🚀 Streaming voice server listening on", PORT);
 });
 
-const PORT = Number(process.env.PORT || 8080);
-app.listen(PORT, "0.0.0.0", () => console.log("🚀 Listening on", PORT));
+// Upgrade HTTP to WebSocket
+server.on("upgrade", (request, socket, head) => {
+  if (request.url === "/media-stream") {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
