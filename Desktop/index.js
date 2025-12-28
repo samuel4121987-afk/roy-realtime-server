@@ -248,17 +248,19 @@ wss.on("connection", (ws) => {
 async function streamToTwilio(text, ws, streamSid) {
   try {
     console.log("🎤 Generating speech:", text);
+    console.log("🔑 ElevenLabs API key present:", !!ELEVENLABS_API_KEY, "length:", (ELEVENLABS_API_KEY || "").length);
     
     // Get MP3 audio from ElevenLabs
     const response = await axios.post(
       "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB/stream",
       {
         text: text,
-        model_id: "eleven_turbo_v2",
+        model_id: "eleven_turbo_v2_5",
         voice_settings: {
           stability: 0.5,
           similarity_boost: 0.75
-        }
+        },
+        output_format: "pcm_16000"
       },
       {
         headers: {
@@ -269,12 +271,15 @@ async function streamToTwilio(text, ws, streamSid) {
       }
     );
 
-    // Use ffmpeg to convert MP3 to µ-law 8kHz
+    // Use ffmpeg to convert PCM 16kHz to µ-law 8kHz
     const ffmpeg = spawn("ffmpeg", [
+      "-f", "s16le",            // Input format: signed 16-bit little-endian PCM
+      "-ar", "16000",           // Input sample rate: 16kHz
+      "-ac", "1",               // Input channels: mono
       "-i", "pipe:0",           // Input from stdin
-      "-ar", "8000",            // 8kHz sample rate
-      "-ac", "1",               // Mono
-      "-f", "mulaw",            // µ-law format
+      "-ar", "8000",            // Output sample rate: 8kHz
+      "-ac", "1",               // Output channels: mono
+      "-f", "mulaw",            // Output format: µ-law
       "pipe:1"                  // Output to stdout
     ]);
 
