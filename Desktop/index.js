@@ -114,6 +114,9 @@ wss.on("connection", (ws) => {
           model: "nova-2",
           language: "en-US",
           smart_format: true,
+          encoding: "mulaw",
+          sample_rate: 8000,
+          channels: 1,
           interim_results: false,
           utterance_end_ms: 1000,
           vad_events: true
